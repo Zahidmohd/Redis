@@ -270,6 +270,9 @@ interface SortedSetMember {
 }
 const sortedSets = new Map<string, SortedSetMember[]>();
 
+// Sets storage (unordered collection of unique strings)
+const sets = new Map<string, Set<string>>();
+
 // ACL user storage
 interface User {
   flags: string[];
@@ -2115,6 +2118,9 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         } else if (sortedSets.has(key)) {
           // Key exists in sorted sets
           connection.write("+zset\r\n");
+        } else if (sets.has(key)) {
+          // Key exists in sets
+          connection.write("+set\r\n");
         } else {
           // Key doesn't exist
           connection.write("+none\r\n");
