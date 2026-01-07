@@ -158,8 +158,8 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       // LRANGE requires three arguments: key, start, stop
       if (parsed.length >= 4) {
         const key = parsed[1];
-        const start = parseInt(parsed[2]);
-        const stop = parseInt(parsed[3]);
+        let start = parseInt(parsed[2]);
+        let stop = parseInt(parsed[3]);
         
         // Get the list
         const list = lists.get(key);
@@ -168,6 +168,24 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         if (!list) {
           connection.write("*0\r\n");
           return;
+        }
+        
+        // Handle negative indexes
+        // Negative indexes count from the end: -1 is last element, -2 is second-to-last, etc.
+        if (start < 0) {
+          start = list.length + start;
+          // If still negative (out of range), treat as 0
+          if (start < 0) {
+            start = 0;
+          }
+        }
+        
+        if (stop < 0) {
+          stop = list.length + stop;
+          // If still negative (out of range), treat as 0
+          if (stop < 0) {
+            stop = 0;
+          }
         }
         
         // If start >= list length, return empty array
