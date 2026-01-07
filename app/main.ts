@@ -94,13 +94,20 @@ function encodeGeohash(longitude: number, latitude: number): number {
   const latBits = Math.floor(latNormalized * 0x3FFFFFF);
   
   // Interleave the bits: longitude bits at even positions, latitude bits at odd positions
+  // Use arithmetic instead of bitwise operations to handle 52-bit numbers
   let geohash = 0;
   for (let i = 0; i < 26; i++) {
     // Extract bit i from longitude and place at position 2*i
-    geohash |= ((lonBits >> i) & 1) << (2 * i);
+    const lonBit = (lonBits >> i) & 1;
+    if (lonBit) {
+      geohash += Math.pow(2, 2 * i);
+    }
     
     // Extract bit i from latitude and place at position 2*i + 1
-    geohash |= ((latBits >> i) & 1) << (2 * i + 1);
+    const latBit = (latBits >> i) & 1;
+    if (latBit) {
+      geohash += Math.pow(2, 2 * i + 1);
+    }
   }
   
   return geohash;
@@ -109,15 +116,24 @@ function encodeGeohash(longitude: number, latitude: number): number {
 // Helper function to decode geohash back to longitude and latitude
 function decodeGeohash(geohash: number): { longitude: number, latitude: number } {
   // De-interleave the bits to extract longitude and latitude
+  // Use arithmetic instead of bitwise operations for 52-bit numbers
   let lonBits = 0;
   let latBits = 0;
   
   for (let i = 0; i < 26; i++) {
     // Extract longitude bit from even position (2*i)
-    lonBits |= ((geohash >> (2 * i)) & 1) << i;
+    const lonBitPosition = 2 * i;
+    const lonBit = Math.floor(geohash / Math.pow(2, lonBitPosition)) % 2;
+    if (lonBit) {
+      lonBits += Math.pow(2, i);
+    }
     
     // Extract latitude bit from odd position (2*i + 1)
-    latBits |= ((geohash >> (2 * i + 1)) & 1) << i;
+    const latBitPosition = 2 * i + 1;
+    const latBit = Math.floor(geohash / Math.pow(2, latBitPosition)) % 2;
+    if (latBit) {
+      latBits += Math.pow(2, i);
+    }
   }
   
   // Convert from 26-bit integers back to normalized [0, 1]
