@@ -176,6 +176,20 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         // Return the length of the list as a RESP integer
         connection.write(encodeInteger(list.length));
       }
+    } else if (command === "llen") {
+      // LLEN requires one argument: key
+      if (parsed.length >= 2) {
+        const key = parsed[1];
+        const list = lists.get(key);
+        
+        // If list doesn't exist, return 0
+        if (!list) {
+          connection.write(encodeInteger(0));
+        } else {
+          // Return the length of the list as a RESP integer
+          connection.write(encodeInteger(list.length));
+        }
+      }
     } else if (command === "lrange") {
       // LRANGE requires three arguments: key, start, stop
       if (parsed.length >= 4) {
