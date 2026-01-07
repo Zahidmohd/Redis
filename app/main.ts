@@ -110,6 +110,16 @@ interface BlockedXReadClient {
 }
 const blockedXReadClients: BlockedXReadClient[] = [];
 
+// Pub/Sub: Track channel subscriptions per client
+const subscriptions = new Map<net.Socket, Set<string>>();
+
+// Sorted sets storage
+interface SortedSetMember {
+  member: string;
+  score: number;
+}
+const sortedSets = new Map<string, SortedSetMember[]>();
+
 // Transaction state per connection
 const transactionState = new Map<net.Socket, boolean>();
 // Queued commands per connection
@@ -582,6 +592,29 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
     // Get command (case-insensitive)
     const command = parsed[0].toLowerCase();
     
+    // Check if client is in subscribed mode
+    const clientSubscriptions = subscriptions.get(connection);
+    const inSubscribedMode = clientSubscriptions && clientSubscriptions.size > 0;
+    
+    // If in subscribed mode, only allow specific commands
+    if (inSubscribedMode) {
+      const allowedInSubscribedMode = [
+        "subscribe",
+        "unsubscribe",
+        "psubscribe",
+        "punsubscribe",
+        "ping",
+        "quit"
+      ];
+      
+      if (!allowedInSubscribedMode.includes(command)) {
+        // Return error for disallowed commands
+        const errorMsg = `-ERR Can't execute '${command}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n`;
+        connection.write(errorMsg);
+        return;
+      }
+    }
+    
     // Check if we're in a transaction and should queue this command
     const inTransaction = transactionState.get(connection);
     if (inTransaction && command !== "exec" && command !== "multi" && command !== "discard") {
@@ -597,7 +630,17 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
     }
     
     if (command === "ping") {
-      connection.write("+PONG\r\n");
+      // Check if client is in subscribed mode
+      if (inSubscribedMode) {
+        // In subscribed mode, respond with array ["pong", ""]
+        let response = "*2\r\n";
+        response += encodeBulkString("pong");
+        response += encodeBulkString("");
+        connection.write(response);
+      } else {
+        // Normal mode: simple string response
+        connection.write("+PONG\r\n");
+      }
     } else if (command === "info") {
       // INFO command with optional section parameter
       const section = parsed.length >= 2 ? parsed[1].toLowerCase() : "";
@@ -809,6 +852,209 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           // Pattern matching not implemented yet
           connection.write("*0\r\n");
         }
+      }
+    } else if (command === "subscribe") {
+      // SUBSCRIBE command - subscribe to a channel
+      if (parsed.length >= 2) {
+        const channelName = parsed[1];
+        
+        // Get or create subscription set for this connection
+        let channels = subscriptions.get(connection);
+        if (!channels) {
+          channels = new Set<string>();
+          subscriptions.set(connection, channels);
+        }
+        
+        // Add channel to subscription set
+        channels.add(channelName);
+        
+        // Build response: ["subscribe", channel_name, num_subscriptions]
+        // Format: *3\r\n$9\r\nsubscribe\r\n$<len>\r\n<channel>\r\n:<count>\r\n
+        let response = "*3\r\n";
+        response += encodeBulkString("subscribe");
+        response += encodeBulkString(channelName);
+        response += encodeInteger(channels.size);
+        
+        connection.write(response);
+      }
+    } else if (command === "unsubscribe") {
+      // UNSUBSCRIBE command - unsubscribe from a channel
+      if (parsed.length >= 2) {
+        const channelName = parsed[1];
+        
+        // Get the client's subscription set
+        let channels = subscriptions.get(connection);
+        if (!channels) {
+          channels = new Set<string>();
+          subscriptions.set(connection, channels);
+        }
+        
+        // Remove channel from subscription set (if it exists)
+        channels.delete(channelName);
+        
+        // Build response: ["unsubscribe", channel_name, remaining_count]
+        let response = "*3\r\n";
+        response += encodeBulkString("unsubscribe");
+        response += encodeBulkString(channelName);
+        response += encodeInteger(channels.size);
+        
+        connection.write(response);
+        
+        // If no more subscriptions, client exits subscribed mode
+        // (this happens automatically via inSubscribedMode check)
+        if (channels.size === 0) {
+          subscriptions.delete(connection);
+        }
+      }
+    } else if (command === "publish") {
+      // PUBLISH command - publish a message to a channel
+      if (parsed.length >= 3) {
+        const channelName = parsed[1];
+        const message = parsed[2];
+        
+        // Build the message to send to subscribers: ["message", channel_name, message_contents]
+        let messageToSubscribers = "*3\r\n";
+        messageToSubscribers += encodeBulkString("message");
+        messageToSubscribers += encodeBulkString(channelName);
+        messageToSubscribers += encodeBulkString(message);
+        
+        // Deliver message to all subscribed clients and count them
+        let subscriberCount = 0;
+        for (const [clientSocket, channels] of subscriptions.entries()) {
+          if (channels.has(channelName)) {
+            subscriberCount++;
+            // Send the message to this subscriber
+            clientSocket.write(messageToSubscribers);
+          }
+        }
+        
+        // Return the number of subscribers as a RESP integer to the publisher
+        connection.write(encodeInteger(subscriberCount));
+      }
+    } else if (command === "zadd") {
+      // ZADD command - add member to sorted set with score
+      if (parsed.length >= 4) {
+        const key = parsed[1];
+        const score = parseFloat(parsed[2]);
+        const member = parsed[3];
+        
+        // Get or create sorted set
+        let sortedSet = sortedSets.get(key);
+        if (!sortedSet) {
+          sortedSet = [];
+          sortedSets.set(key, sortedSet);
+        }
+        
+        // Check if member already exists
+        const existingIndex = sortedSet.findIndex(m => m.member === member);
+        let newMembersAdded = 0;
+        
+        if (existingIndex === -1) {
+          // New member - add it in sorted position
+          newMembersAdded = 1;
+          
+          // Find the correct position to insert (maintain sorted order by score, then lexicographically)
+          let insertIndex = 0;
+          for (let i = 0; i < sortedSet.length; i++) {
+            if (sortedSet[i].score > score) {
+              break;
+            } else if (sortedSet[i].score === score && sortedSet[i].member > member) {
+              // Same score, but lexicographically after the new member
+              break;
+            }
+            insertIndex = i + 1;
+          }
+          
+          // Insert at the correct position
+          sortedSet.splice(insertIndex, 0, { member, score });
+        } else {
+          // Member exists - update score if different
+          if (sortedSet[existingIndex].score !== score) {
+            // Remove old entry
+            sortedSet.splice(existingIndex, 1);
+            
+            // Find new position and insert (maintain sorted order by score, then lexicographically)
+            let insertIndex = 0;
+            for (let i = 0; i < sortedSet.length; i++) {
+              if (sortedSet[i].score > score) {
+                break;
+              } else if (sortedSet[i].score === score && sortedSet[i].member > member) {
+                // Same score, but lexicographically after the new member
+                break;
+              }
+              insertIndex = i + 1;
+            }
+            sortedSet.splice(insertIndex, 0, { member, score });
+          }
+          // newMembersAdded remains 0 since member already existed
+        }
+        
+        // Return the number of new members added
+        connection.write(encodeInteger(newMembersAdded));
+      }
+    } else if (command === "zrank") {
+      // ZRANK command - get the rank (index) of a member in a sorted set
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const member = parsed[2];
+        
+        // Check if sorted set exists
+        const sortedSet = sortedSets.get(key);
+        if (!sortedSet) {
+          // Sorted set doesn't exist
+          connection.write("$-1\r\n");
+          return;
+        }
+        
+        // Find the member in the sorted set
+        const memberIndex = sortedSet.findIndex(m => m.member === member);
+        
+        if (memberIndex === -1) {
+          // Member doesn't exist
+          connection.write("$-1\r\n");
+        } else {
+          // Return the rank (0-based index)
+          connection.write(encodeInteger(memberIndex));
+        }
+      }
+    } else if (command === "zrange") {
+      // ZRANGE command - list members in a sorted set by index range
+      if (parsed.length >= 4) {
+        const key = parsed[1];
+        const startIndex = parseInt(parsed[2]);
+        const stopIndex = parseInt(parsed[3]);
+        
+        // Check if sorted set exists
+        const sortedSet = sortedSets.get(key);
+        if (!sortedSet) {
+          // Sorted set doesn't exist - return empty array
+          connection.write("*0\r\n");
+          return;
+        }
+        
+        // Get the cardinality (size) of the sorted set
+        const cardinality = sortedSet.length;
+        
+        // If start index >= cardinality, return empty array
+        if (startIndex >= cardinality) {
+          connection.write("*0\r\n");
+          return;
+        }
+        
+        // If start > stop, return empty array
+        if (startIndex > stopIndex) {
+          connection.write("*0\r\n");
+          return;
+        }
+        
+        // Adjust stop index if it's greater than cardinality
+        const adjustedStopIndex = Math.min(stopIndex, cardinality - 1);
+        
+        // Extract the range (slice is exclusive at end, so add 1)
+        const members = sortedSet.slice(startIndex, adjustedStopIndex + 1).map(m => m.member);
+        
+        // Return as RESP array
+        connection.write(encodeArray(members));
       }
     } else if (command === "set") {
       // SET requires two arguments: key and value
@@ -1102,6 +1348,9 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         } else if (streams.has(key)) {
           // Key exists in streams
           connection.write("+stream\r\n");
+        } else if (sortedSets.has(key)) {
+          // Key exists in sorted sets
+          connection.write("+zset\r\n");
         } else {
           // Key doesn't exist
           connection.write("+none\r\n");
@@ -1543,6 +1792,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
   connection.on("close", () => {
     transactionState.delete(connection);
     queuedCommands.delete(connection);
+    subscriptions.delete(connection);
     
     // Remove from replicas list if this was a replica connection
     const replicaIndex = replicas.indexOf(connection);
