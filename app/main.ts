@@ -329,7 +329,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
     
     // Check if we're in a transaction and should queue this command
     const inTransaction = transactionState.get(connection);
-    if (inTransaction && command !== "exec" && command !== "multi") {
+    if (inTransaction && command !== "exec" && command !== "multi" && command !== "discard") {
       // Queue the command
       let queue = queuedCommands.get(connection);
       if (!queue) {
@@ -375,6 +375,17 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         }
         
         connection.write(arrayResponse);
+      }
+    } else if (command === "discard") {
+      // Check if MULTI was called
+      const inTransaction = transactionState.get(connection);
+      if (!inTransaction) {
+        connection.write("-ERR DISCARD without MULTI\r\n");
+      } else {
+        // Abort the transaction - clear state and queue
+        transactionState.delete(connection);
+        queuedCommands.delete(connection);
+        connection.write("+OK\r\n");
       }
     } else if (command === "echo") {
       // ECHO requires one argument
