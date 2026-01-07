@@ -98,6 +98,110 @@ interface BlockedClient {
 }
 const blockedClients = new Map<string, BlockedClient[]>();
 
+// Blocked clients waiting for XREAD
+interface BlockedXReadClient {
+  socket: net.Socket;
+  streamKeys: string[];
+  afterIds: string[];
+  timestamp: number;
+  timeoutId?: NodeJS.Timeout;
+}
+const blockedXReadClients: BlockedXReadClient[] = [];
+
+// Helper function to wake up blocked XREAD clients when entries are added to a stream
+function wakeUpBlockedXReadClients(streamKey: string): void {
+  // Check all blocked XREAD clients
+  for (let i = blockedXReadClients.length - 1; i >= 0; i--) {
+    const client = blockedXReadClients[i];
+    
+    // Check if this client is waiting for this stream
+    const streamIndex = client.streamKeys.indexOf(streamKey);
+    if (streamIndex === -1) {
+      continue; // This client isn't waiting for this stream
+    }
+    
+    // Check if there are new entries for this stream
+    const stream = streams.get(streamKey);
+    if (!stream || stream.length === 0) {
+      continue;
+    }
+    
+    const afterId = parseStreamId(client.afterIds[streamIndex], 0);
+    let hasNewEntries = false;
+    
+    for (const entry of stream) {
+      const entryId = parseStreamId(entry.id, 0);
+      if (compareStreamIds(entryId, afterId) > 0) {
+        hasNewEntries = true;
+        break;
+      }
+    }
+    
+    if (!hasNewEntries) {
+      continue;
+    }
+    
+    // This client has new entries, wake it up
+    // Clear timeout if it exists
+    if (client.timeoutId) {
+      clearTimeout(client.timeoutId);
+    }
+    
+    // Build response for all streams this client is waiting for
+    const streamResults: Array<{ key: string; entries: StreamEntry[] }> = [];
+    
+    for (let j = 0; j < client.streamKeys.length; j++) {
+      const key = client.streamKeys[j];
+      const afterIdStr = client.afterIds[j];
+      const s = streams.get(key);
+      
+      if (!s) continue;
+      
+      const aid = parseStreamId(afterIdStr, 0);
+      const results: StreamEntry[] = [];
+      
+      for (const entry of s) {
+        const entryId = parseStreamId(entry.id, 0);
+        if (compareStreamIds(entryId, aid) > 0) {
+          results.push(entry);
+        }
+      }
+      
+      if (results.length > 0) {
+        streamResults.push({ key, entries: results });
+      }
+    }
+    
+    // Build and send response
+    let response = `*${streamResults.length}\r\n`;
+    for (const streamResult of streamResults) {
+      response += "*2\r\n";
+      response += encodeBulkString(streamResult.key);
+      response += `*${streamResult.entries.length}\r\n`;
+      
+      for (const entry of streamResult.entries) {
+        response += "*2\r\n";
+        response += encodeBulkString(entry.id);
+        
+        const fieldValues: string[] = [];
+        for (const [field, value] of entry.fields) {
+          fieldValues.push(field);
+          fieldValues.push(value);
+        }
+        response += `*${fieldValues.length}\r\n`;
+        for (const item of fieldValues) {
+          response += encodeBulkString(item);
+        }
+      }
+    }
+    
+    client.socket.write(response);
+    
+    // Remove this client from blocked list
+    blockedXReadClients.splice(i, 1);
+  }
+}
+
 // Helper function to wake up blocked clients when elements are added
 function wakeUpBlockedClients(key: string): void {
   const blocked = blockedClients.get(key);
