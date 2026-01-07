@@ -94,6 +94,99 @@ function encodeNull(connection: net.Socket): string {
   return version === 3 ? encodeRESP3Null() : encodeBulkString(null);
 }
 
+// Bloom Filter implementation
+class BloomFilter {
+  private bitArray: Uint8Array;
+  private capacity: number;
+  private errorRate: number;
+  private numBits: number;
+  private numHashes: number;
+  private itemCount: number;
+
+  constructor(capacity: number = 100, errorRate: number = 0.01) {
+    this.capacity = capacity;
+    this.errorRate = errorRate;
+    this.itemCount = 0;
+
+    // Calculate optimal number of bits: m = -(n * ln(p)) / (ln(2)^2)
+    // where n = capacity, p = error rate
+    this.numBits = Math.ceil(-(capacity * Math.log(errorRate)) / (Math.log(2) ** 2));
+    
+    // Calculate optimal number of hash functions: k = (m/n) * ln(2)
+    this.numHashes = Math.ceil((this.numBits / capacity) * Math.log(2));
+    
+    // Create bit array (divide by 8 to get bytes)
+    const numBytes = Math.ceil(this.numBits / 8);
+    this.bitArray = new Uint8Array(numBytes);
+  }
+
+  // Hash function using FNV-1a algorithm
+  private hash(item: string, seed: number): number {
+    let hash = 2166136261 ^ seed; // FNV offset basis XOR with seed
+    for (let i = 0; i < item.length; i++) {
+      hash ^= item.charCodeAt(i);
+      hash = Math.imul(hash, 16777619); // FNV prime
+    }
+    return (hash >>> 0) % this.numBits; // Ensure positive and within range
+  }
+
+  // Add an item to the bloom filter
+  add(item: string): boolean {
+    let wasAlreadyPresent = true;
+    
+    for (let i = 0; i < this.numHashes; i++) {
+      const bitIndex = this.hash(item, i);
+      const byteIndex = Math.floor(bitIndex / 8);
+      const bitOffset = bitIndex % 8;
+      
+      const mask = 1 << bitOffset;
+      
+      // Check if bit was already set
+      if ((this.bitArray[byteIndex] & mask) === 0) {
+        wasAlreadyPresent = false;
+        this.bitArray[byteIndex] |= mask;
+      }
+    }
+    
+    // Only increment count if item wasn't already present
+    if (!wasAlreadyPresent) {
+      this.itemCount++;
+    }
+    
+    return !wasAlreadyPresent; // Return true if newly added
+  }
+
+  // Check if an item exists in the bloom filter
+  exists(item: string): boolean {
+    for (let i = 0; i < this.numHashes; i++) {
+      const bitIndex = this.hash(item, i);
+      const byteIndex = Math.floor(bitIndex / 8);
+      const bitOffset = bitIndex % 8;
+      
+      const mask = 1 << bitOffset;
+      
+      // If any bit is not set, item definitely doesn't exist
+      if ((this.bitArray[byteIndex] & mask) === 0) {
+        return false;
+      }
+    }
+    
+    // All bits are set, item might exist (could be false positive)
+    return true;
+  }
+
+  // Get info about the bloom filter
+  getInfo(): { capacity: number; size: number; numFilters: number; numItemsInserted: number; expansionRate: number } {
+    return {
+      capacity: this.capacity,
+      size: this.numBits,
+      numFilters: 1,
+      numItemsInserted: this.itemCount,
+      expansionRate: 2
+    };
+  }
+}
+
 // Helper function to parse stream entry ID (handles optional sequence number)
 function parseStreamId(id: string, defaultSeq: number): { msTime: number; seqNum: number } {
   const parts = id.split('-');
@@ -272,6 +365,9 @@ const sortedSets = new Map<string, SortedSetMember[]>();
 
 // Sets storage (unordered collection of unique strings)
 const sets = new Map<string, Set<string>>();
+
+// Bloom filters storage
+const bloomFilters = new Map<string, BloomFilter>();
 
 // ACL user storage
 interface User {
@@ -1577,6 +1673,158 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         const members = Array.from(difference);
         connection.write(encodeArray(members));
       }
+    } else if (command === "bf.reserve") {
+      // BF.RESERVE command - create a bloom filter with custom parameters
+      // Format: BF.RESERVE key error_rate capacity
+      if (parsed.length >= 4) {
+        const key = parsed[1];
+        const errorRate = parseFloat(parsed[2]);
+        const capacity = parseInt(parsed[3]);
+        
+        // Check if bloom filter already exists
+        if (bloomFilters.has(key)) {
+          connection.write("-ERR item exists\r\n");
+          return;
+        }
+        
+        // Validate parameters
+        if (errorRate <= 0 || errorRate >= 1) {
+          connection.write("-ERR error rate must be between 0 and 1\r\n");
+          return;
+        }
+        
+        if (capacity <= 0) {
+          connection.write("-ERR capacity must be positive\r\n");
+          return;
+        }
+        
+        // Create new bloom filter
+        const bf = new BloomFilter(capacity, errorRate);
+        bloomFilters.set(key, bf);
+        incrementKeyVersion(key);
+        
+        connection.write("+OK\r\n");
+      }
+    } else if (command === "bf.add") {
+      // BF.ADD command - add an item to a bloom filter
+      // Format: BF.ADD key item
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const item = parsed[2];
+        
+        // Get or create bloom filter (auto-create with defaults)
+        let bf = bloomFilters.get(key);
+        if (!bf) {
+          bf = new BloomFilter(100, 0.01); // Default: 100 capacity, 1% error rate
+          bloomFilters.set(key, bf);
+        }
+        
+        // Add item and return result
+        const added = bf.add(item);
+        incrementKeyVersion(key);
+        
+        // Return 1 if newly added, 0 if already existed (might exist)
+        connection.write(encodeInteger(added ? 1 : 0));
+      }
+    } else if (command === "bf.exists") {
+      // BF.EXISTS command - check if an item exists in a bloom filter
+      // Format: BF.EXISTS key item
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const item = parsed[2];
+        
+        const bf = bloomFilters.get(key);
+        
+        if (!bf) {
+          // Bloom filter doesn't exist, item definitely doesn't exist
+          connection.write(encodeInteger(0));
+        } else {
+          // Check if item exists (might be false positive)
+          const exists = bf.exists(item);
+          connection.write(encodeInteger(exists ? 1 : 0));
+        }
+      }
+    } else if (command === "bf.madd") {
+      // BF.MADD command - add multiple items to a bloom filter
+      // Format: BF.MADD key item [item ...]
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const items = parsed.slice(2);
+        
+        // Get or create bloom filter
+        let bf = bloomFilters.get(key);
+        if (!bf) {
+          bf = new BloomFilter(100, 0.01);
+          bloomFilters.set(key, bf);
+        }
+        
+        // Add all items and collect results
+        const results: number[] = [];
+        for (const item of items) {
+          const added = bf.add(item);
+          results.push(added ? 1 : 0);
+        }
+        
+        incrementKeyVersion(key);
+        
+        // Return array of results
+        let response = `*${results.length}\r\n`;
+        for (const result of results) {
+          response += encodeInteger(result);
+        }
+        connection.write(response);
+      }
+    } else if (command === "bf.mexists") {
+      // BF.MEXISTS command - check if multiple items exist in a bloom filter
+      // Format: BF.MEXISTS key item [item ...]
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const items = parsed.slice(2);
+        
+        const bf = bloomFilters.get(key);
+        
+        // Check all items
+        const results: number[] = [];
+        for (const item of items) {
+          if (!bf) {
+            results.push(0);
+          } else {
+            const exists = bf.exists(item);
+            results.push(exists ? 1 : 0);
+          }
+        }
+        
+        // Return array of results
+        let response = `*${results.length}\r\n`;
+        for (const result of results) {
+          response += encodeInteger(result);
+        }
+        connection.write(response);
+      }
+    } else if (command === "bf.info") {
+      // BF.INFO command - get information about a bloom filter
+      // Format: BF.INFO key
+      if (parsed.length >= 2) {
+        const key = parsed[1];
+        const bf = bloomFilters.get(key);
+        
+        if (!bf) {
+          connection.write("-ERR not found\r\n");
+        } else {
+          const info = bf.getInfo();
+          
+          // Return as array of key-value pairs
+          const response: string[] = [
+            "Capacity", info.capacity.toString(),
+            "Size", info.size.toString(),
+            "Number of filters", info.numFilters.toString(),
+            "Number of items inserted", info.numItemsInserted.toString(),
+            "Expansion rate", info.expansionRate.toString()
+          ];
+          
+          connection.write(encodeArray(response));
+        }
+      }
     } else if (command === "zadd") {
       // ZADD command - add member to sorted set with score
       if (parsed.length >= 4) {
@@ -2319,6 +2567,9 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         } else if (sets.has(key)) {
           // Key exists in sets
           connection.write("+set\r\n");
+        } else if (bloomFilters.has(key)) {
+          // Key exists in bloom filters
+          connection.write("+MBbloom--\r\n");
         } else {
           // Key doesn't exist
           connection.write("+none\r\n");
