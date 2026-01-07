@@ -4,6 +4,7 @@ package-lock.json
 # Ignore all markdown files except README.md
 *.md
 !README.md
+doc/
 
 # Test scripts (temporary)
 test_optimistic_locking.sh
