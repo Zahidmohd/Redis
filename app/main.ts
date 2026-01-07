@@ -55,6 +55,22 @@ function encodeArray(items: string[]): string {
   return result;
 }
 
+// Helper function to parse stream entry ID (handles optional sequence number)
+function parseStreamId(id: string, defaultSeq: number): { msTime: number; seqNum: number } {
+  const parts = id.split('-');
+  const msTime = parseInt(parts[0]);
+  const seqNum = parts.length > 1 && parts[1] !== '' ? parseInt(parts[1]) : defaultSeq;
+  return { msTime, seqNum };
+}
+
+// Helper function to compare stream entry IDs
+function compareStreamIds(id1: { msTime: number; seqNum: number }, id2: { msTime: number; seqNum: number }): number {
+  if (id1.msTime !== id2.msTime) {
+    return id1.msTime - id2.msTime;
+  }
+  return id1.seqNum - id2.seqNum;
+}
+
 // In-memory storage for key-value pairs with expiry
 interface StoredValue {
   value: string;
