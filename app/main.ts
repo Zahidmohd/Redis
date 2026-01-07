@@ -2682,6 +2682,269 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           connection.write(encodeInteger(1));
         }
       }
+    } else if (command === "setbit") {
+      // SETBIT command - set bit at offset
+      // Format: SETBIT key offset value
+      if (parsed.length >= 4) {
+        const key = parsed[1];
+        const offset = parseInt(parsed[2]);
+        const value = parseInt(parsed[3]);
+        
+        // Validate offset and value
+        if (offset < 0) {
+          connection.write("-ERR bit offset is not an integer or out of range\r\n");
+          return;
+        }
+        
+        if (value !== 0 && value !== 1) {
+          connection.write("-ERR bit is not an integer or out of range\r\n");
+          return;
+        }
+        
+        // Get current value or create empty string
+        const storedValue = store.get(key);
+        let binaryData = storedValue ? Buffer.from(storedValue.value, 'binary') : Buffer.alloc(0);
+        
+        // Calculate byte and bit position
+        const byteIndex = Math.floor(offset / 8);
+        const bitIndex = 7 - (offset % 8); // MSB first
+        
+        // Expand buffer if necessary
+        if (byteIndex >= binaryData.length) {
+          const newBuffer = Buffer.alloc(byteIndex + 1);
+          binaryData.copy(newBuffer);
+          binaryData = newBuffer;
+        }
+        
+        // Get old bit value
+        const oldBit = (binaryData[byteIndex] >> bitIndex) & 1;
+        
+        // Set new bit value
+        if (value === 1) {
+          binaryData[byteIndex] |= (1 << bitIndex);
+        } else {
+          binaryData[byteIndex] &= ~(1 << bitIndex);
+        }
+        
+        // Store updated value
+        store.set(key, {
+          value: binaryData.toString('binary'),
+          expiresAt: storedValue?.expiresAt
+        });
+        
+        incrementKeyVersion(key);
+        appendToAOF(parsed);
+        
+        // Return old bit value
+        connection.write(encodeInteger(oldBit));
+      }
+    } else if (command === "getbit") {
+      // GETBIT command - get bit at offset
+      // Format: GETBIT key offset
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const offset = parseInt(parsed[2]);
+        
+        // Validate offset
+        if (offset < 0) {
+          connection.write("-ERR bit offset is not an integer or out of range\r\n");
+          return;
+        }
+        
+        const storedValue = store.get(key);
+        
+        if (!storedValue) {
+          // Key doesn't exist - return 0
+          connection.write(encodeInteger(0));
+          return;
+        }
+        
+        const binaryData = Buffer.from(storedValue.value, 'binary');
+        const byteIndex = Math.floor(offset / 8);
+        
+        // If offset is beyond string, return 0
+        if (byteIndex >= binaryData.length) {
+          connection.write(encodeInteger(0));
+          return;
+        }
+        
+        const bitIndex = 7 - (offset % 8); // MSB first
+        const bit = (binaryData[byteIndex] >> bitIndex) & 1;
+        
+        connection.write(encodeInteger(bit));
+      }
+    } else if (command === "bitcount") {
+      // BITCOUNT command - count set bits
+      // Format: BITCOUNT key [start end]
+      if (parsed.length >= 2) {
+        const key = parsed[1];
+        const storedValue = store.get(key);
+        
+        if (!storedValue) {
+          // Key doesn't exist - return 0
+          connection.write(encodeInteger(0));
+          return;
+        }
+        
+        const binaryData = Buffer.from(storedValue.value, 'binary');
+        let start = 0;
+        let end = binaryData.length - 1;
+        
+        // Parse optional start and end (byte offsets)
+        if (parsed.length >= 4) {
+          start = parseInt(parsed[2]);
+          end = parseInt(parsed[3]);
+          
+          // Handle negative indexes
+          if (start < 0) start = binaryData.length + start;
+          if (end < 0) end = binaryData.length + end;
+          
+          // Clamp to valid range
+          start = Math.max(0, Math.min(start, binaryData.length - 1));
+          end = Math.max(0, Math.min(end, binaryData.length - 1));
+        }
+        
+        // Count set bits in range
+        let count = 0;
+        for (let i = start; i <= end && i < binaryData.length; i++) {
+          let byte = binaryData[i];
+          // Brian Kernighan's algorithm to count set bits
+          while (byte) {
+            byte &= byte - 1;
+            count++;
+          }
+        }
+        
+        connection.write(encodeInteger(count));
+      }
+    } else if (command === "bitpos") {
+      // BITPOS command - find first bit with given value
+      // Format: BITPOS key bit [start [end]]
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const bit = parseInt(parsed[2]);
+        
+        if (bit !== 0 && bit !== 1) {
+          connection.write("-ERR bit is not an integer or out of range\r\n");
+          return;
+        }
+        
+        const storedValue = store.get(key);
+        
+        if (!storedValue) {
+          // Key doesn't exist
+          if (bit === 0) {
+            connection.write(encodeInteger(0)); // First 0 bit is at position 0
+          } else {
+            connection.write(encodeInteger(-1)); // No 1 bits found
+          }
+          return;
+        }
+        
+        const binaryData = Buffer.from(storedValue.value, 'binary');
+        let start = 0;
+        let end = binaryData.length - 1;
+        
+        // Parse optional start and end (byte offsets)
+        if (parsed.length >= 4) {
+          start = parseInt(parsed[3]);
+          if (parsed.length >= 5) {
+            end = parseInt(parsed[4]);
+          }
+          
+          // Handle negative indexes
+          if (start < 0) start = binaryData.length + start;
+          if (end < 0) end = binaryData.length + end;
+          
+          // Clamp to valid range
+          start = Math.max(0, Math.min(start, binaryData.length));
+          end = Math.max(-1, Math.min(end, binaryData.length - 1));
+        }
+        
+        // Find first bit with given value
+        for (let byteIdx = start; byteIdx <= end && byteIdx < binaryData.length; byteIdx++) {
+          const byte = binaryData[byteIdx];
+          
+          for (let bitIdx = 7; bitIdx >= 0; bitIdx--) {
+            const currentBit = (byte >> bitIdx) & 1;
+            if (currentBit === bit) {
+              const position = byteIdx * 8 + (7 - bitIdx);
+              connection.write(encodeInteger(position));
+              return;
+            }
+          }
+        }
+        
+        // Bit not found
+        connection.write(encodeInteger(-1));
+      }
+    } else if (command === "bitop") {
+      // BITOP command - perform bitwise operation
+      // Format: BITOP operation destkey key [key ...]
+      if (parsed.length >= 4) {
+        const operation = parsed[1].toUpperCase();
+        const destKey = parsed[2];
+        const srcKeys = parsed.slice(3);
+        
+        if (!["AND", "OR", "XOR", "NOT"].includes(operation)) {
+          connection.write("-ERR syntax error\r\n");
+          return;
+        }
+        
+        if (operation === "NOT" && srcKeys.length !== 1) {
+          connection.write("-ERR BITOP NOT must have exactly one source key\r\n");
+          return;
+        }
+        
+        // Get all source values
+        const sources: Buffer[] = [];
+        let maxLength = 0;
+        
+        for (const srcKey of srcKeys) {
+          const storedValue = store.get(srcKey);
+          const buffer = storedValue ? Buffer.from(storedValue.value, 'binary') : Buffer.alloc(0);
+          sources.push(buffer);
+          maxLength = Math.max(maxLength, buffer.length);
+        }
+        
+        // Perform operation
+        const result = Buffer.alloc(maxLength);
+        
+        if (operation === "NOT") {
+          for (let i = 0; i < sources[0].length; i++) {
+            result[i] = ~sources[0][i];
+          }
+        } else {
+          for (let i = 0; i < maxLength; i++) {
+            let value = operation === "AND" ? 0xFF : 0x00;
+            
+            for (const source of sources) {
+              const byte = i < source.length ? source[i] : 0;
+              
+              if (operation === "AND") {
+                value &= byte;
+              } else if (operation === "OR") {
+                value |= byte;
+              } else if (operation === "XOR") {
+                value ^= byte;
+              }
+            }
+            
+            result[i] = value;
+          }
+        }
+        
+        // Store result
+        store.set(destKey, {
+          value: result.toString('binary')
+        });
+        
+        incrementKeyVersion(destKey);
+        appendToAOF(parsed);
+        
+        // Return length of result
+        connection.write(encodeInteger(result.length));
+      }
     } else if (command === "rpush") {
       // RPUSH requires at least two arguments: key and one or more values
       if (parsed.length >= 3) {
