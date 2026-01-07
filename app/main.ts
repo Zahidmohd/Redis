@@ -1,4 +1,6 @@
 import * as net from "net";
+import * as fs from "fs";
+import * as path from "path";
 
 // You can use print statements as follows for debugging, they'll be visible when running tests.
 console.log("Logs from your program will appear here!");
@@ -119,6 +121,10 @@ let serverRole = "master"; // Default role
 let masterHost: string | null = null;
 let masterPort: number | null = null;
 
+// RDB configuration
+let configDir = "/tmp/redis-data"; // Default directory
+let configDbfilename = "dump.rdb"; // Default filename
+
 const cmdArgs = process.argv.slice(2); // Skip 'node' and script name
 for (let i = 0; i < cmdArgs.length; i++) {
   if (cmdArgs[i] === '--port' && i + 1 < cmdArgs.length) {
@@ -132,8 +138,205 @@ for (let i = 0; i < cmdArgs.length; i++) {
       masterHost = parts[0];
       masterPort = parseInt(parts[1]);
     }
+  } else if (cmdArgs[i] === '--dir' && i + 1 < cmdArgs.length) {
+    configDir = cmdArgs[i + 1];
+  } else if (cmdArgs[i] === '--dbfilename' && i + 1 < cmdArgs.length) {
+    configDbfilename = cmdArgs[i + 1];
   }
 }
+
+// Helper function to read length-encoded integer from RDB
+function readLength(buffer: Buffer, offset: number): { value: number, bytesRead: number, isSpecial: boolean } {
+  const firstByte = buffer[offset];
+  const type = (firstByte & 0xC0) >> 6; // First 2 bits
+  
+  if (type === 0b00) {
+    // 6-bit length
+    return { value: firstByte & 0x3F, bytesRead: 1, isSpecial: false };
+  } else if (type === 0b01) {
+    // 14-bit length
+    const nextByte = buffer[offset + 1];
+    const length = ((firstByte & 0x3F) << 8) | nextByte;
+    return { value: length, bytesRead: 2, isSpecial: false };
+  } else if (type === 0b10) {
+    // 32-bit length (big-endian)
+    const length = buffer.readUInt32BE(offset + 1);
+    return { value: length, bytesRead: 5, isSpecial: false };
+  } else {
+    // Special format (type === 0b11)
+    const specialType = firstByte & 0x3F;
+    return { value: specialType, bytesRead: 1, isSpecial: true };
+  }
+}
+
+// Helper function to read a string from RDB
+function readString(buffer: Buffer, offset: number): { value: string, bytesRead: number } {
+  const lengthInfo = readLength(buffer, offset);
+  let currentOffset = offset + lengthInfo.bytesRead;
+  
+  if (lengthInfo.isSpecial) {
+    // Special encoding (integers as strings, compressed strings, etc.)
+    const specialType = lengthInfo.value;
+    
+    if (specialType === 0) {
+      // 8-bit integer
+      const intValue = buffer.readInt8(currentOffset);
+      return { value: intValue.toString(), bytesRead: lengthInfo.bytesRead + 1 };
+    } else if (specialType === 1) {
+      // 16-bit integer
+      const intValue = buffer.readInt16LE(currentOffset);
+      return { value: intValue.toString(), bytesRead: lengthInfo.bytesRead + 2 };
+    } else if (specialType === 2) {
+      // 32-bit integer
+      const intValue = buffer.readInt32LE(currentOffset);
+      return { value: intValue.toString(), bytesRead: lengthInfo.bytesRead + 4 };
+    } else if (specialType === 3) {
+      // Compressed string - not implemented
+      throw new Error("Compressed strings not supported");
+    }
+  }
+  
+  // Regular string - length-prefixed
+  const strValue = buffer.toString('utf8', currentOffset, currentOffset + lengthInfo.value);
+  return { value: strValue, bytesRead: lengthInfo.bytesRead + lengthInfo.value };
+}
+
+// Function to read RDB file and load data
+function loadRDBFile() {
+  const rdbPath = path.join(configDir, configDbfilename);
+  
+  // Check if file exists
+  if (!fs.existsSync(rdbPath)) {
+    console.log(`RDB file not found at ${rdbPath}, starting with empty database`);
+    return;
+  }
+  
+  try {
+    const buffer = fs.readFileSync(rdbPath);
+    console.log(`Loading RDB file from ${rdbPath} (${buffer.length} bytes)`);
+    
+    let offset = 0;
+    
+    // Check magic string "REDIS"
+    const magic = buffer.toString('ascii', offset, offset + 5);
+    if (magic !== 'REDIS') {
+      console.log('Invalid RDB file: magic string mismatch');
+      return;
+    }
+    offset += 5;
+    
+    // Read version (4 bytes)
+    const version = buffer.toString('ascii', offset, offset + 4);
+    console.log(`RDB version: ${version}`);
+    offset += 4;
+    
+    // Parse the file
+    while (offset < buffer.length) {
+      const opcode = buffer[offset];
+      offset++;
+      
+      if (opcode === 0xFF) {
+        // EOF marker
+        console.log('Reached EOF marker');
+        break;
+      } else if (opcode === 0xFE) {
+        // Database selector
+        const dbNumber = buffer[offset];
+        offset++;
+        console.log(`Database selector: ${dbNumber}`);
+      } else if (opcode === 0xFB) {
+        // Hash table size info
+        const hashTableSize = buffer[offset];
+        offset++;
+        const expiryHashTableSize = buffer[offset];
+        offset++;
+        console.log(`Hash table size: ${hashTableSize}, expiry: ${expiryHashTableSize}`);
+      } else if (opcode === 0xFA) {
+        // Metadata
+        const keyResult = readString(buffer, offset);
+        const key = keyResult.value;
+        offset += keyResult.bytesRead;
+        
+        const valueResult = readString(buffer, offset);
+        const value = valueResult.value;
+        offset += valueResult.bytesRead;
+        console.log(`Metadata: ${key} = ${value}`);
+      } else if (opcode === 0xFC) {
+        // Expiry time in milliseconds (8 bytes)
+        const expiryMs = buffer.readBigUInt64LE(offset);
+        offset += 8;
+        
+        // Read value type
+        const valueType = buffer[offset];
+        offset++;
+        
+        // Read key
+        const keyResult = readString(buffer, offset);
+        const key = keyResult.value;
+        offset += keyResult.bytesRead;
+        
+        // Read value (string)
+        const valueResult = readString(buffer, offset);
+        const value = valueResult.value;
+        offset += valueResult.bytesRead;
+        
+        store.set(key, {
+          value: value,
+          expiresAt: Number(expiryMs)
+        });
+        console.log(`Loaded key with expiry: ${key} = ${value}, expires at ${expiryMs}`);
+      } else if (opcode === 0xFD) {
+        // Expiry time in seconds (4 bytes)
+        const expirySec = buffer.readUInt32LE(offset);
+        offset += 4;
+        
+        // Read value type
+        const valueType = buffer[offset];
+        offset++;
+        
+        // Read key
+        const keyResult = readString(buffer, offset);
+        const key = keyResult.value;
+        offset += keyResult.bytesRead;
+        
+        // Read value (string)
+        const valueResult = readString(buffer, offset);
+        const value = valueResult.value;
+        offset += valueResult.bytesRead;
+        
+        store.set(key, {
+          value: value,
+          expiresAt: expirySec * 1000
+        });
+        console.log(`Loaded key with expiry: ${key} = ${value}, expires at ${expirySec}s`);
+      } else if (opcode === 0x00) {
+        // String value (no expiry)
+        // Read key
+        const keyResult = readString(buffer, offset);
+        const key = keyResult.value;
+        offset += keyResult.bytesRead;
+        
+        // Read value
+        const valueResult = readString(buffer, offset);
+        const value = valueResult.value;
+        offset += valueResult.bytesRead;
+        
+        store.set(key, { value: value });
+        console.log(`Loaded key: ${key} = ${value}`);
+      } else {
+        console.log(`Unknown opcode: 0x${opcode.toString(16)}`);
+        break;
+      }
+    }
+    
+    console.log(`Loaded ${store.size} keys from RDB file`);
+  } catch (error) {
+    console.log(`Error loading RDB file: ${error}`);
+  }
+}
+
+// Load RDB file on startup
+loadRDBFile();
 
 // Replication ID and offset (for master servers)
 const masterReplId = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
@@ -414,6 +617,26 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         // Other sections not implemented yet
         connection.write(encodeBulkString(""));
       }
+    } else if (command === "config") {
+      // CONFIG command - for now only handle CONFIG GET
+      if (parsed.length >= 3 && parsed[1].toLowerCase() === "get") {
+        const parameter = parsed[2].toLowerCase();
+        
+        // Build response array: [parameter_name, parameter_value]
+        let response = "*2\r\n";
+        response += encodeBulkString(parameter);
+        
+        if (parameter === "dir") {
+          response += encodeBulkString(configDir);
+        } else if (parameter === "dbfilename") {
+          response += encodeBulkString(configDbfilename);
+        } else {
+          // Unknown parameter - return empty value
+          response += encodeBulkString("");
+        }
+        
+        connection.write(response);
+      }
     } else if (command === "replconf") {
       // REPLCONF command - used during replication handshake
       // Don't respond to REPLCONF ACK (sent by replicas in response to GETACK)
@@ -559,6 +782,33 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       if (parsed.length >= 2) {
         const message = parsed[1];
         connection.write(encodeBulkString(message));
+      }
+    } else if (command === "keys") {
+      // KEYS command - returns all keys matching pattern
+      if (parsed.length >= 2) {
+        const pattern = parsed[1];
+        
+        // For now, only support "*" (all keys)
+        if (pattern === "*") {
+          const keys: string[] = [];
+          
+          // Get all keys from store (excluding expired ones)
+          for (const [key, storedValue] of store.entries()) {
+            // Check if key has expired
+            if (storedValue.expiresAt && Date.now() > storedValue.expiresAt) {
+              // Key expired, skip it
+              store.delete(key);
+              continue;
+            }
+            keys.push(key);
+          }
+          
+          // Return as RESP array
+          connection.write(encodeArray(keys));
+        } else {
+          // Pattern matching not implemented yet
+          connection.write("*0\r\n");
+        }
       }
     } else if (command === "set") {
       // SET requires two arguments: key and value
