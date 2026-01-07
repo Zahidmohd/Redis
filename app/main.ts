@@ -252,6 +252,13 @@ const transactionState = new Map<net.Socket, boolean>();
 // Queued commands per connection
 const queuedCommands = new Map<net.Socket, string[][]>();
 
+// Optimistic locking: Track watched keys per connection
+const watchedKeys = new Map<net.Socket, Set<string>>();
+// Track snapshot of key versions when MULTI is called (for each connection)
+const watchedKeyVersions = new Map<net.Socket, Map<string, number>>();
+// Track version number for each key (incremented on every modification)
+const keyVersions = new Map<string, number>();
+
 // Authenticated user per connection (null = not authenticated)
 const authenticatedUser = new Map<net.Socket, string | null>();
 
@@ -343,7 +350,7 @@ function readString(buffer: Buffer, offset: number): { value: string, bytesRead:
 
 // Function to read RDB file and load data
 function loadRDBFile() {
-  const rdbPath = path.join(configDir, configDbfilename);
+  const rdbPath = `${configDir}/${configDbfilename}`;
   
   // Check if file exists
   if (!fs.existsSync(rdbPath)) {
@@ -640,6 +647,12 @@ function wakeUpBlockedClients(key: string): void {
   }
 }
 
+// Helper function to increment key version (for optimistic locking)
+function incrementKeyVersion(key: string): void {
+  const currentVersion = keyVersions.get(key) || 0;
+  keyVersions.set(key, currentVersion + 1);
+}
+
 // Helper function to execute a command and return the response
 function executeCommand(parsed: string[]): string {
   const command = parsed[0].toLowerCase();
@@ -662,6 +675,7 @@ function executeCommand(parsed: string[]): string {
       }
       
       store.set(key, { value, expiresAt });
+      incrementKeyVersion(key); // Track modification for WATCH
       return "+OK\r\n";
     }
   } else if (command === "get") {
@@ -699,9 +713,11 @@ function executeCommand(parsed: string[]): string {
           expiresAt: storedValue.expiresAt
         });
         
+        incrementKeyVersion(key); // Track modification for WATCH
         return encodeInteger(newValue);
       } else {
         store.set(key, { value: "1" });
+        incrementKeyVersion(key); // Track modification for WATCH
         return encodeInteger(1);
       }
     }
@@ -982,10 +998,43 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           }
         }
       });
+    } else if (command === "watch") {
+      // WATCH command - mark keys to watch for modifications
+      if (parsed.length >= 2) {
+        // Get or create watched keys set for this connection
+        let watched = watchedKeys.get(connection);
+        if (!watched) {
+          watched = new Set<string>();
+          watchedKeys.set(connection, watched);
+        }
+        
+        // Add all specified keys to watched set
+        for (let i = 1; i < parsed.length; i++) {
+          watched.add(parsed[i]);
+        }
+        
+        connection.write("+OK\r\n");
+      }
+    } else if (command === "unwatch") {
+      // UNWATCH command - remove all watched keys
+      watchedKeys.delete(connection);
+      watchedKeyVersions.delete(connection);
+      connection.write("+OK\r\n");
     } else if (command === "multi") {
       // Start a transaction
       transactionState.set(connection, true);
       queuedCommands.set(connection, []);
+      
+      // Snapshot current versions of watched keys
+      const watched = watchedKeys.get(connection);
+      if (watched && watched.size > 0) {
+        const versionSnapshot = new Map<string, number>();
+        for (const key of watched) {
+          versionSnapshot.set(key, keyVersions.get(key) || 0);
+        }
+        watchedKeyVersions.set(connection, versionSnapshot);
+      }
+      
       connection.write("+OK\r\n");
     } else if (command === "exec") {
       // Check if MULTI was called
@@ -993,27 +1042,50 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       if (!inTransaction) {
         connection.write("-ERR EXEC without MULTI\r\n");
       } else {
+        // Check if any watched keys have been modified
+        const versionSnapshot = watchedKeyVersions.get(connection);
+        let transactionAborted = false;
+        
+        if (versionSnapshot && versionSnapshot.size > 0) {
+          // Compare current versions with snapshot
+          for (const [key, snapshotVersion] of versionSnapshot) {
+            const currentVersion = keyVersions.get(key) || 0;
+            if (currentVersion !== snapshotVersion) {
+              // Key was modified by another client - abort transaction
+              transactionAborted = true;
+              break;
+            }
+          }
+        }
+        
         // Get queued commands
         const queue = queuedCommands.get(connection) || [];
         
-        // Clear the transaction state and queue
+        // Clear the transaction state, queue, and watched keys
         transactionState.delete(connection);
         queuedCommands.delete(connection);
+        watchedKeys.delete(connection);
+        watchedKeyVersions.delete(connection);
         
-        // Execute all queued commands and collect responses
-        const responses: string[] = [];
-        for (const queuedCmd of queue) {
-          const response = executeCommand(queuedCmd);
-          responses.push(response);
+        if (transactionAborted) {
+          // Return null bulk string to indicate transaction was aborted
+          connection.write("$-1\r\n");
+        } else {
+          // Execute all queued commands and collect responses
+          const responses: string[] = [];
+          for (const queuedCmd of queue) {
+            const response = executeCommand(queuedCmd);
+            responses.push(response);
+          }
+          
+          // Build the array response
+          let arrayResponse = `*${responses.length}\r\n`;
+          for (const response of responses) {
+            arrayResponse += response;
+          }
+          
+          connection.write(arrayResponse);
         }
-        
-        // Build the array response
-        let arrayResponse = `*${responses.length}\r\n`;
-        for (const response of responses) {
-          arrayResponse += response;
-        }
-        
-        connection.write(arrayResponse);
       }
     } else if (command === "discard") {
       // Check if MULTI was called
@@ -1021,9 +1093,11 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       if (!inTransaction) {
         connection.write("-ERR DISCARD without MULTI\r\n");
       } else {
-        // Abort the transaction - clear state and queue
+        // Abort the transaction - clear state, queue, and watched keys
         transactionState.delete(connection);
         queuedCommands.delete(connection);
+        watchedKeys.delete(connection);
+        watchedKeyVersions.delete(connection);
         connection.write("+OK\r\n");
       }
     } else if (command === "wait") {
@@ -1244,6 +1318,8 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           // newMembersAdded remains 0 since member already existed
         }
         
+        incrementKeyVersion(key); // Track modification for WATCH
+        
         // Return the number of new members added
         connection.write(encodeInteger(newMembersAdded));
       }
@@ -1392,6 +1468,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         } else {
           // Remove the member from the sorted set
           sortedSet.splice(memberIndex, 1);
+          incrementKeyVersion(key); // Track modification for WATCH
           // Return 1 (number of members removed)
           connection.write(encodeInteger(1));
         }
@@ -1469,6 +1546,8 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           }
           // newMembersAdded remains 0 since member already existed
         }
+        
+        incrementKeyVersion(key); // Track modification for WATCH
         
         // Return the number of new members added
         connection.write(encodeInteger(newMembersAdded));
@@ -1642,6 +1721,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         }
         
         store.set(key, { value, expiresAt });
+        incrementKeyVersion(key); // Track modification for WATCH
         connection.write("+OK\r\n");
         
         // Propagate write command to replicas
@@ -1697,6 +1777,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
             expiresAt: storedValue.expiresAt
           });
           
+          incrementKeyVersion(key); // Track modification for WATCH
           // Return the new value as RESP integer
           connection.write(encodeInteger(newValue));
         } else {
@@ -1705,6 +1786,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
             value: "1"
           });
           
+          incrementKeyVersion(key); // Track modification for WATCH
           // Return 1 as RESP integer
           connection.write(encodeInteger(1));
         }
@@ -1724,6 +1806,8 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         
         // Push all values to the right (end) of the list
         list.push(...values);
+        
+        incrementKeyVersion(key); // Track modification for WATCH
         
         // Capture the length BEFORE waking up blocked clients
         const lengthAfterPush = list.length;
@@ -1752,6 +1836,8 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         for (const value of values) {
           list.unshift(value);
         }
+        
+        incrementKeyVersion(key); // Track modification for WATCH
         
         // Capture the length BEFORE waking up blocked clients
         const lengthAfterPush = list.length;
@@ -1792,6 +1878,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         } else if (count === 1) {
           // Single element: return as bulk string (backward compatibility)
           const element = list.shift();
+          incrementKeyVersion(key); // Track modification for WATCH
           connection.write(encodeBulkString(element!));
           
           // Clean up empty list
@@ -1811,6 +1898,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
             }
           }
           
+          incrementKeyVersion(key); // Track modification for WATCH
           // Return as RESP array
           connection.write(encodeArray(removed));
           
@@ -2060,6 +2148,8 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           fields: fields
         };
         stream.push(entry);
+        
+        incrementKeyVersion(streamKey); // Track modification for WATCH
         
         // Wake up any blocked XREAD clients waiting for this stream
         wakeUpBlockedXReadClients(streamKey);
@@ -2352,6 +2442,8 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
   connection.on("close", () => {
     transactionState.delete(connection);
     queuedCommands.delete(connection);
+    watchedKeys.delete(connection);
+    watchedKeyVersions.delete(connection);
     subscriptions.delete(connection);
     authenticatedUser.delete(connection);
     
@@ -2364,8 +2456,13 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
   });
 });
 
-server.listen(serverPort, "127.0.0.1");
-console.log(`Redis server listening on port ${serverPort} as ${serverRole}`);
+const PORT = Number(process.env.PORT) || serverPort;
+
+if (import.meta.main) {
+  server.listen(PORT, "127.0.0.1", () => {
+    console.log(`Redis server listening on port ${PORT} as ${serverRole}`);
+  });
+}
 
 // If this is a replica, initiate handshake with master
 if (serverRole === "slave" && masterHost && masterPort) {
@@ -2497,6 +2594,7 @@ if (serverRole === "slave" && masterHost && masterPort) {
             }
             
             store.set(key, { value, expiresAt });
+            incrementKeyVersion(key); // Track modification for WATCH
             console.log(`SET ${key} = ${value}`);
           }
         }
