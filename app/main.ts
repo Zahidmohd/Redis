@@ -309,6 +309,30 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           connection.write(encodeBulkString(null));
         }
       }
+    } else if (command === "incr") {
+      // INCR requires one argument: key
+      if (parsed.length >= 2) {
+        const key = parsed[1];
+        const storedValue = store.get(key);
+        
+        // For this stage, we only handle existing keys with numerical values
+        if (storedValue) {
+          // Parse the current value as integer
+          const currentValue = parseInt(storedValue.value);
+          
+          // Increment by 1
+          const newValue = currentValue + 1;
+          
+          // Store the new value
+          store.set(key, {
+            value: newValue.toString(),
+            expiresAt: storedValue.expiresAt
+          });
+          
+          // Return the new value as RESP integer
+          connection.write(encodeInteger(newValue));
+        }
+      }
     } else if (command === "rpush") {
       // RPUSH requires at least two arguments: key and one or more values
       if (parsed.length >= 3) {
