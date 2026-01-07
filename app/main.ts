@@ -359,6 +359,24 @@ function sha1(str: string): string {
   return crypto.createHash('sha1').update(str).digest('hex');
 }
 
+// Helper function to get command group
+function getCommandGroup(cmdName: string): string {
+  const groupMap: Record<string, string> = {
+    'get': 'string', 'set': 'string', 'incr': 'string', 'decr': 'string',
+    'lpush': 'list', 'rpush': 'list', 'lpop': 'list', 'llen': 'list', 'lrange': 'list',
+    'sadd': 'set', 'smembers': 'set', 'sismember': 'set', 'srem': 'set', 'scard': 'set', 'sinter': 'set', 'sunion': 'set', 'sdiff': 'set',
+    'hset': 'hash', 'hget': 'hash', 'hgetall': 'hash', 'hdel': 'hash', 'hexists': 'hash', 'hkeys': 'hash', 'hvals': 'hash', 'hlen': 'hash', 'hincrby': 'hash',
+    'zadd': 'sorted-set', 'zrange': 'sorted-set', 'zrank': 'sorted-set',
+    'setbit': 'bitmap', 'getbit': 'bitmap', 'bitcount': 'bitmap', 'bitop': 'bitmap',
+    'watch': 'transactions', 'multi': 'transactions', 'exec': 'transactions', 'discard': 'transactions', 'unwatch': 'transactions',
+    'eval': 'scripting', 'evalsha': 'scripting', 'script': 'scripting',
+    'ping': 'connection', 'echo': 'connection', 'hello': 'connection',
+    'type': 'generic', 'del': 'generic', 'exists': 'generic', 'keys': 'generic',
+    'info': 'server', 'config': 'server', 'command': 'server'
+  };
+  return groupMap[cmdName] || 'generic';
+}
+
 // Helper function to parse stream entry ID (handles optional sequence number)
 function parseStreamId(id: string, defaultSeq: number): { msTime: number; seqNum: number } {
   const parts = id.split('-');
@@ -540,6 +558,72 @@ const sets = new Map<string, Set<string>>();
 
 // Hashes storage (maps field names to values)
 const hashes = new Map<string, Map<string, string>>();
+
+// Command metadata registry
+interface CommandInfo {
+  name: string;
+  arity: number; // Negative means "at least N args"
+  flags: string[]; // readonly, write, fast, slow, etc.
+  firstKey: number; // Position of first key (1-based, 0 means no keys)
+  lastKey: number; // Position of last key
+  keyStep: number; // Step between keys
+  summary: string;
+  since: string;
+}
+
+const commandRegistry: Map<string, CommandInfo> = new Map([
+  ["ping", { name: "ping", arity: -1, flags: ["fast"], firstKey: 0, lastKey: 0, keyStep: 0, summary: "Ping the server", since: "1.0.0" }],
+  ["echo", { name: "echo", arity: 2, flags: ["fast"], firstKey: 0, lastKey: 0, keyStep: 0, summary: "Echo the given string", since: "1.0.0" }],
+  ["get", { name: "get", arity: 2, flags: ["readonly", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Get the value of a key", since: "1.0.0" }],
+  ["set", { name: "set", arity: -3, flags: ["write"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Set the string value of a key", since: "1.0.0" }],
+  ["del", { name: "del", arity: -2, flags: ["write"], firstKey: 1, lastKey: -1, keyStep: 1, summary: "Delete a key", since: "1.0.0" }],
+  ["exists", { name: "exists", arity: -2, flags: ["readonly", "fast"], firstKey: 1, lastKey: -1, keyStep: 1, summary: "Determine if a key exists", since: "1.0.0" }],
+  ["incr", { name: "incr", arity: 2, flags: ["write", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Increment the integer value of a key by one", since: "1.0.0" }],
+  ["decr", { name: "decr", arity: 2, flags: ["write", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Decrement the integer value of a key by one", since: "1.0.0" }],
+  ["lpush", { name: "lpush", arity: -3, flags: ["write", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Prepend one or multiple elements to a list", since: "1.0.0" }],
+  ["rpush", { name: "rpush", arity: -3, flags: ["write", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Append one or multiple elements to a list", since: "1.0.0" }],
+  ["lpop", { name: "lpop", arity: -2, flags: ["write", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Remove and get the first elements in a list", since: "1.0.0" }],
+  ["llen", { name: "llen", arity: 2, flags: ["readonly", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Get the length of a list", since: "1.0.0" }],
+  ["lrange", { name: "lrange", arity: 4, flags: ["readonly"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Get a range of elements from a list", since: "1.0.0" }],
+  ["sadd", { name: "sadd", arity: -3, flags: ["write", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Add one or more members to a set", since: "1.0.0" }],
+  ["smembers", { name: "smembers", arity: 2, flags: ["readonly"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Get all the members in a set", since: "1.0.0" }],
+  ["sismember", { name: "sismember", arity: 3, flags: ["readonly", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Determine if a given value is a member of a set", since: "1.0.0" }],
+  ["srem", { name: "srem", arity: -3, flags: ["write", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Remove one or more members from a set", since: "1.0.0" }],
+  ["scard", { name: "scard", arity: 2, flags: ["readonly", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Get the number of members in a set", since: "1.0.0" }],
+  ["sinter", { name: "sinter", arity: -2, flags: ["readonly"], firstKey: 1, lastKey: -1, keyStep: 1, summary: "Intersect multiple sets", since: "1.0.0" }],
+  ["sunion", { name: "sunion", arity: -2, flags: ["readonly"], firstKey: 1, lastKey: -1, keyStep: 1, summary: "Add multiple sets", since: "1.0.0" }],
+  ["sdiff", { name: "sdiff", arity: -2, flags: ["readonly"], firstKey: 1, lastKey: -1, keyStep: 1, summary: "Subtract multiple sets", since: "1.0.0" }],
+  ["hset", { name: "hset", arity: -4, flags: ["write", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Set the string value of a hash field", since: "2.0.0" }],
+  ["hget", { name: "hget", arity: 3, flags: ["readonly", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Get the value of a hash field", since: "2.0.0" }],
+  ["hgetall", { name: "hgetall", arity: 2, flags: ["readonly"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Get all the fields and values in a hash", since: "2.0.0" }],
+  ["hdel", { name: "hdel", arity: -3, flags: ["write", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Delete one or more hash fields", since: "2.0.0" }],
+  ["hexists", { name: "hexists", arity: 3, flags: ["readonly", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Determine if a hash field exists", since: "2.0.0" }],
+  ["hkeys", { name: "hkeys", arity: 2, flags: ["readonly"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Get all the fields in a hash", since: "2.0.0" }],
+  ["hvals", { name: "hvals", arity: 2, flags: ["readonly"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Get all the values in a hash", since: "2.0.0" }],
+  ["hlen", { name: "hlen", arity: 2, flags: ["readonly", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Get the number of fields in a hash", since: "2.0.0" }],
+  ["hincrby", { name: "hincrby", arity: 4, flags: ["write", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Increment the integer value of a hash field by the given number", since: "2.0.0" }],
+  ["zadd", { name: "zadd", arity: -4, flags: ["write", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Add one or more members to a sorted set", since: "1.2.0" }],
+  ["zrange", { name: "zrange", arity: -4, flags: ["readonly"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Return a range of members in a sorted set", since: "1.2.0" }],
+  ["zrank", { name: "zrank", arity: 3, flags: ["readonly", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Determine the index of a member in a sorted set", since: "2.0.0" }],
+  ["type", { name: "type", arity: 2, flags: ["readonly", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Determine the type stored at key", since: "1.0.0" }],
+  ["info", { name: "info", arity: -1, flags: ["readonly"], firstKey: 0, lastKey: 0, keyStep: 0, summary: "Get information and statistics about the server", since: "1.0.0" }],
+  ["config", { name: "config", arity: -2, flags: ["admin"], firstKey: 0, lastKey: 0, keyStep: 0, summary: "Get or set configuration parameters", since: "2.0.0" }],
+  ["keys", { name: "keys", arity: 2, flags: ["readonly", "slow"], firstKey: 0, lastKey: 0, keyStep: 0, summary: "Find all keys matching the given pattern", since: "1.0.0" }],
+  ["multi", { name: "multi", arity: 1, flags: ["fast"], firstKey: 0, lastKey: 0, keyStep: 0, summary: "Mark the start of a transaction block", since: "1.2.0" }],
+  ["exec", { name: "exec", arity: 1, flags: ["slow"], firstKey: 0, lastKey: 0, keyStep: 0, summary: "Execute all commands issued after MULTI", since: "1.2.0" }],
+  ["discard", { name: "discard", arity: 1, flags: ["fast"], firstKey: 0, lastKey: 0, keyStep: 0, summary: "Discard all commands issued after MULTI", since: "2.0.0" }],
+  ["watch", { name: "watch", arity: -2, flags: ["fast"], firstKey: 1, lastKey: -1, keyStep: 1, summary: "Watch the given keys to determine execution of the MULTI/EXEC block", since: "2.2.0" }],
+  ["unwatch", { name: "unwatch", arity: 1, flags: ["fast"], firstKey: 0, lastKey: 0, keyStep: 0, summary: "Forget about all watched keys", since: "2.2.0" }],
+  ["setbit", { name: "setbit", arity: 4, flags: ["write"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Sets or clears the bit at offset in the string value stored at key", since: "2.2.0" }],
+  ["getbit", { name: "getbit", arity: 3, flags: ["readonly", "fast"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Returns the bit value at offset in the string value stored at key", since: "2.2.0" }],
+  ["bitcount", { name: "bitcount", arity: -2, flags: ["readonly"], firstKey: 1, lastKey: 1, keyStep: 1, summary: "Count set bits in a string", since: "2.6.0" }],
+  ["bitop", { name: "bitop", arity: -4, flags: ["write"], firstKey: 2, lastKey: -1, keyStep: 1, summary: "Perform bitwise operations between strings", since: "2.6.0" }],
+  ["eval", { name: "eval", arity: -3, flags: ["slow"], firstKey: 0, lastKey: 0, keyStep: 0, summary: "Execute a Lua script server side", since: "2.6.0" }],
+  ["evalsha", { name: "evalsha", arity: -3, flags: ["slow"], firstKey: 0, lastKey: 0, keyStep: 0, summary: "Execute a Lua script server side by its SHA1 digest", since: "2.6.0" }],
+  ["script", { name: "script", arity: -2, flags: ["slow"], firstKey: 0, lastKey: 0, keyStep: 0, summary: "A container for Lua scripts management commands", since: "2.6.0" }],
+  ["hello", { name: "hello", arity: -1, flags: ["fast"], firstKey: 0, lastKey: 0, keyStep: 0, summary: "Handshake with Redis", since: "6.0.0" }],
+  ["command", { name: "command", arity: -1, flags: ["readonly", "slow"], firstKey: 0, lastKey: 0, keyStep: 0, summary: "Get array of Redis command details", since: "2.8.13" }],
+]);
 
 // Lua script cache (SHA1 -> script)
 const scriptCache = new Map<string, string>();
@@ -3540,6 +3624,108 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           connection.write("+OK\r\n");
         } else {
           connection.write("-ERR unknown SCRIPT subcommand\r\n");
+        }
+      }
+    } else if (command === "command") {
+      // COMMAND command - introspection of Redis commands
+      if (parsed.length === 1) {
+        // COMMAND (no args) - return all commands
+        const commands = Array.from(commandRegistry.values());
+        let response = `*${commands.length}\r\n`;
+        
+        for (const cmd of commands) {
+          // Each command is an array: [name, arity, flags, first_key, last_key, step]
+          response += "*10\r\n";
+          response += encodeBulkString(cmd.name);
+          response += encodeInteger(cmd.arity);
+          // Flags array
+          response += `*${cmd.flags.length}\r\n`;
+          for (const flag of cmd.flags) {
+            response += encodeBulkString(flag);
+          }
+          response += encodeInteger(cmd.firstKey);
+          response += encodeInteger(cmd.lastKey);
+          response += encodeInteger(cmd.keyStep);
+          // ACL categories (empty for now)
+          response += "*0\r\n";
+          // Tips (empty for now)
+          response += "*0\r\n";
+          // Key specifications (empty for now)
+          response += "*0\r\n";
+          // Subcommands (empty for now)
+          response += "*0\r\n";
+        }
+        
+        connection.write(response);
+      } else {
+        const subcommand = parsed[1].toLowerCase();
+        
+        if (subcommand === "info") {
+          // COMMAND INFO command [command ...]
+          const commandNames = parsed.slice(2).map(c => c.toLowerCase());
+          let response = `*${commandNames.length}\r\n`;
+          
+          for (const cmdName of commandNames) {
+            const cmd = commandRegistry.get(cmdName);
+            
+            if (!cmd) {
+              response += encodeNull(connection);
+            } else {
+              // Command info array
+              response += "*10\r\n";
+              response += encodeBulkString(cmd.name);
+              response += encodeInteger(cmd.arity);
+              // Flags array
+              response += `*${cmd.flags.length}\r\n`;
+              for (const flag of cmd.flags) {
+                response += encodeBulkString(flag);
+              }
+              response += encodeInteger(cmd.firstKey);
+              response += encodeInteger(cmd.lastKey);
+              response += encodeInteger(cmd.keyStep);
+              // ACL categories
+              response += "*0\r\n";
+              // Tips
+              response += "*0\r\n";
+              // Key specifications
+              response += "*0\r\n";
+              // Subcommands
+              response += "*0\r\n";
+            }
+          }
+          
+          connection.write(response);
+        } else if (subcommand === "count") {
+          // COMMAND COUNT - return number of commands
+          connection.write(encodeInteger(commandRegistry.size));
+        } else if (subcommand === "list") {
+          // COMMAND LIST - return list of command names
+          const commandNames = Array.from(commandRegistry.keys());
+          connection.write(encodeArray(commandNames));
+        } else if (subcommand === "docs") {
+          // COMMAND DOCS command [command ...]
+          const commandNames = parsed.slice(2).map(c => c.toLowerCase());
+          let response = `*${commandNames.length}\r\n`;
+          
+          for (const cmdName of commandNames) {
+            const cmd = commandRegistry.get(cmdName);
+            
+            if (!cmd) {
+              response += encodeNull(connection);
+            } else {
+              // Build docs map
+              const docMap = new Map<string, string>();
+              docMap.set("summary", cmd.summary);
+              docMap.set("since", cmd.since);
+              docMap.set("group", getCommandGroup(cmd.name));
+              
+              response += encodeRESP3Map(docMap);
+            }
+          }
+          
+          connection.write(response);
+        } else {
+          connection.write("-ERR unknown COMMAND subcommand\r\n");
         }
       }
     } else if (command === "rpush") {
