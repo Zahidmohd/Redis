@@ -108,6 +108,11 @@ interface BlockedXReadClient {
 }
 const blockedXReadClients: BlockedXReadClient[] = [];
 
+// Transaction state per connection
+const transactionState = new Map<net.Socket, boolean>();
+// Queued commands per connection
+const queuedCommands = new Map<net.Socket, string[][]>();
+
 // Helper function to wake up blocked XREAD clients when entries are added to a stream
 function wakeUpBlockedXReadClients(streamKey: string): void {
   // Check all blocked XREAD clients
@@ -255,7 +260,21 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
     if (command === "ping") {
       connection.write("+PONG\r\n");
     } else if (command === "multi") {
+      // Start a transaction
+      transactionState.set(connection, true);
       connection.write("+OK\r\n");
+    } else if (command === "exec") {
+      // Check if MULTI was called
+      const inTransaction = transactionState.get(connection);
+      if (!inTransaction) {
+        connection.write("-ERR EXEC without MULTI\r\n");
+      } else {
+        // Execute the transaction (empty for now)
+        // Clear the transaction state
+        transactionState.delete(connection);
+        // Return empty array
+        connection.write("*0\r\n");
+      }
     } else if (command === "echo") {
       // ECHO requires one argument
       if (parsed.length >= 2) {
@@ -984,6 +1003,11 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         connection.write(encodeArray(range));
       }
     }
+  });
+  
+  // Clean up transaction state when connection closes
+  connection.on("close", () => {
+    transactionState.delete(connection);
   });
 });
 
