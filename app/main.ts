@@ -257,6 +257,20 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
     // Get command (case-insensitive)
     const command = parsed[0].toLowerCase();
     
+    // Check if we're in a transaction and should queue this command
+    const inTransaction = transactionState.get(connection);
+    if (inTransaction && command !== "exec" && command !== "multi") {
+      // Queue the command
+      let queue = queuedCommands.get(connection);
+      if (!queue) {
+        queue = [];
+        queuedCommands.set(connection, queue);
+      }
+      queue.push(parsed);
+      connection.write("+QUEUED\r\n");
+      return;
+    }
+    
     if (command === "ping") {
       connection.write("+PONG\r\n");
     } else if (command === "multi") {
