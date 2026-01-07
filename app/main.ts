@@ -578,10 +578,13 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       }
       
       // Parse start and end IDs
+      // Special handling for '-' which means minimum ID
       // If sequence number is not provided:
       // - For start ID, default to 0
       // - For end ID, default to max value (use large number)
-      const startId = parseStreamId(startIdStr, 0);
+      const startId = startIdStr === '-' 
+        ? { msTime: 0, seqNum: 0 } 
+        : parseStreamId(startIdStr, 0);
       const endId = parseStreamId(endIdStr, Number.MAX_SAFE_INTEGER);
       
       // Filter entries within range (inclusive)
