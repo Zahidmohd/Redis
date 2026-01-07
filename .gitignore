@@ -1,4 +1,5 @@
 node_modules/
+package-lock.json
 project_plan.md
 OPTIMISTIC_LOCKING.md
 IMPLEMENTATION_NOTES.md
