@@ -416,7 +416,13 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       }
     } else if (command === "replconf") {
       // REPLCONF command - used during replication handshake
-      // For now, we just acknowledge with OK regardless of arguments
+      // Don't respond to REPLCONF ACK (sent by replicas in response to GETACK)
+      if (parsed.length >= 2 && parsed[1].toLowerCase() === "ack") {
+        // This is a REPLCONF ACK response, don't send anything back
+        // The ACK listener we set up will handle updating the offset
+        return;
+      }
+      // For other REPLCONF commands, acknowledge with OK
       connection.write("+OK\r\n");
     } else if (command === "psync") {
       // PSYNC command - used during replication handshake
