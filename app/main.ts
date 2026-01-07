@@ -113,6 +113,28 @@ const transactionState = new Map<net.Socket, boolean>();
 // Queued commands per connection
 const queuedCommands = new Map<net.Socket, string[][]>();
 
+// Parse command-line arguments
+let serverPort = 6379; // Default port
+let serverRole = "master"; // Default role
+let masterHost: string | null = null;
+let masterPort: number | null = null;
+
+const cmdArgs = process.argv.slice(2); // Skip 'node' and script name
+for (let i = 0; i < cmdArgs.length; i++) {
+  if (cmdArgs[i] === '--port' && i + 1 < cmdArgs.length) {
+    serverPort = parseInt(cmdArgs[i + 1]);
+  } else if (cmdArgs[i] === '--replicaof' && i + 1 < cmdArgs.length) {
+    serverRole = "slave";
+    // Parse "host port" from the argument
+    const replicaofValue = cmdArgs[i + 1];
+    const parts = replicaofValue.split(' ');
+    if (parts.length === 2) {
+      masterHost = parts[0];
+      masterPort = parseInt(parts[1]);
+    }
+  }
+}
+
 // Helper function to wake up blocked XREAD clients when entries are added to a stream
 function wakeUpBlockedXReadClients(streamKey: string): void {
   // Check all blocked XREAD clients
@@ -1136,16 +1158,27 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
   });
 });
 
-// Parse command-line arguments for custom port
+// Parse command-line arguments
 let port = 6379; // Default port
+let role = "master"; // Default role
+let masterHost: string | null = null;
+let masterPort: number | null = null;
 
 const args = process.argv.slice(2); // Skip 'node' and script name
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--port' && i + 1 < args.length) {
     port = parseInt(args[i + 1]);
-    break;
+  } else if (args[i] === '--replicaof' && i + 1 < args.length) {
+    role = "slave";
+    // Parse "host port" from the argument
+    const replicaofValue = args[i + 1];
+    const parts = replicaofValue.split(' ');
+    if (parts.length === 2) {
+      masterHost = parts[0];
+      masterPort = parseInt(parts[1]);
+    }
   }
 }
 
 server.listen(port, "127.0.0.1");
-console.log(`Redis server listening on port ${port}`);
+console.log(`Redis server listening on port ${port} as ${role}`);
