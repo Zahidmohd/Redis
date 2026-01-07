@@ -66,6 +66,13 @@ const store = new Map<string, StoredValue>();
 // In-memory storage for lists
 const lists = new Map<string, string[]>();
 
+// In-memory storage for streams
+interface StreamEntry {
+  id: string;
+  fields: Map<string, string>;
+}
+const streams = new Map<string, StreamEntry[]>();
+
 // Blocked clients waiting for BLPOP
 interface BlockedClient {
   socket: net.Socket;
@@ -378,10 +385,46 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         } else if (lists.has(key)) {
           // Key exists in lists
           connection.write("+list\r\n");
+        } else if (streams.has(key)) {
+          // Key exists in streams
+          connection.write("+stream\r\n");
         } else {
           // Key doesn't exist
           connection.write("+none\r\n");
         }
+      }
+    } else if (command === "xadd") {
+      // XADD requires at least 4 arguments: stream_key, entry_id, field1, value1, ...
+      if (parsed.length >= 4) {
+        const streamKey = parsed[1];
+        const entryId = parsed[2];
+        
+        // Parse field-value pairs
+        const fields = new Map<string, string>();
+        for (let i = 3; i < parsed.length; i += 2) {
+          if (i + 1 < parsed.length) {
+            const field = parsed[i];
+            const value = parsed[i + 1];
+            fields.set(field, value);
+          }
+        }
+        
+        // Get or create the stream
+        let stream = streams.get(streamKey);
+        if (!stream) {
+          stream = [];
+          streams.set(streamKey, stream);
+        }
+        
+        // Create and add the entry
+        const entry: StreamEntry = {
+          id: entryId,
+          fields: fields
+        };
+        stream.push(entry);
+        
+        // Return the entry ID as a bulk string
+        connection.write(encodeBulkString(entryId));
       }
     } else if (command === "lrange") {
       // LRANGE requires three arguments: key, start, stop
