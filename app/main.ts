@@ -316,8 +316,18 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         const storedValue = store.get(key);
         
         if (storedValue) {
-          // Key exists - parse current value as integer and increment
-          const currentValue = parseInt(storedValue.value);
+          // Key exists - validate and parse current value as integer
+          const trimmedValue = storedValue.value.trim();
+          const currentValue = parseInt(trimmedValue);
+          
+          // Check if the value is a valid integer
+          // Must not be NaN and the trimmed string should match the integer pattern
+          if (isNaN(currentValue) || !/^-?\d+$/.test(trimmedValue)) {
+            // Value is not a valid integer
+            connection.write("-ERR value is not an integer or out of range\r\n");
+            return;
+          }
+          
           const newValue = currentValue + 1;
           
           // Store the new value (preserve expiry if it exists)
