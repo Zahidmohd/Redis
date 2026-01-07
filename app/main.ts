@@ -343,6 +343,18 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
     
     if (command === "ping") {
       connection.write("+PONG\r\n");
+    } else if (command === "info") {
+      // INFO command with optional section parameter
+      const section = parsed.length >= 2 ? parsed[1].toLowerCase() : "";
+      
+      // For now, we only handle the replication section
+      if (section === "" || section === "replication") {
+        const response = "role:master";
+        connection.write(encodeBulkString(response));
+      } else {
+        // Other sections not implemented yet
+        connection.write(encodeBulkString(""));
+      }
     } else if (command === "multi") {
       // Start a transaction
       transactionState.set(connection, true);
@@ -1124,4 +1136,16 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
   });
 });
 
-server.listen(6379, "127.0.0.1");
+// Parse command-line arguments for custom port
+let port = 6379; // Default port
+
+const args = process.argv.slice(2); // Skip 'node' and script name
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === '--port' && i + 1 < args.length) {
+    port = parseInt(args[i + 1]);
+    break;
+  }
+}
+
+server.listen(port, "127.0.0.1");
+console.log(`Redis server listening on port ${port}`);
