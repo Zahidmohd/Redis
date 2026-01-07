@@ -1379,6 +1379,204 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         // Return the number of subscribers as a RESP integer to the publisher
         connection.write(encodeInteger(subscriberCount));
       }
+    } else if (command === "sadd") {
+      // SADD command - add one or more members to a set
+      // Format: SADD key member [member ...]
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const members = parsed.slice(2);
+        
+        // Get or create the set
+        let set = sets.get(key);
+        if (!set) {
+          set = new Set<string>();
+          sets.set(key, set);
+        }
+        
+        // Add members and count how many were actually added (not already in set)
+        let addedCount = 0;
+        for (const member of members) {
+          const sizeBefore = set.size;
+          set.add(member);
+          if (set.size > sizeBefore) {
+            addedCount++;
+          }
+        }
+        
+        incrementKeyVersion(key); // Track modification for WATCH
+        
+        // Return the number of new members added
+        connection.write(encodeInteger(addedCount));
+      }
+    } else if (command === "smembers") {
+      // SMEMBERS command - get all members of a set
+      // Format: SMEMBERS key
+      if (parsed.length >= 2) {
+        const key = parsed[1];
+        const set = sets.get(key);
+        
+        if (!set) {
+          // Set doesn't exist - return empty array
+          connection.write("*0\r\n");
+        } else {
+          // Return all members as an array
+          const members = Array.from(set);
+          connection.write(encodeArray(members));
+        }
+      }
+    } else if (command === "sismember") {
+      // SISMEMBER command - check if member is in set
+      // Format: SISMEMBER key member
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const member = parsed[2];
+        const set = sets.get(key);
+        
+        if (!set || !set.has(member)) {
+          // Set doesn't exist or member not in set
+          connection.write(encodeInteger(0));
+        } else {
+          // Member is in set
+          connection.write(encodeInteger(1));
+        }
+      }
+    } else if (command === "srem") {
+      // SREM command - remove one or more members from a set
+      // Format: SREM key member [member ...]
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const members = parsed.slice(2);
+        const set = sets.get(key);
+        
+        if (!set) {
+          // Set doesn't exist - return 0
+          connection.write(encodeInteger(0));
+        } else {
+          // Remove members and count how many were actually removed
+          let removedCount = 0;
+          for (const member of members) {
+            if (set.delete(member)) {
+              removedCount++;
+            }
+          }
+          
+          // Clean up empty set
+          if (set.size === 0) {
+            sets.delete(key);
+          }
+          
+          if (removedCount > 0) {
+            incrementKeyVersion(key); // Track modification for WATCH
+          }
+          
+          // Return the number of members removed
+          connection.write(encodeInteger(removedCount));
+        }
+      }
+    } else if (command === "scard") {
+      // SCARD command - get the cardinality (number of members) of a set
+      // Format: SCARD key
+      if (parsed.length >= 2) {
+        const key = parsed[1];
+        const set = sets.get(key);
+        
+        if (!set) {
+          // Set doesn't exist - return 0
+          connection.write(encodeInteger(0));
+        } else {
+          // Return the number of members
+          connection.write(encodeInteger(set.size));
+        }
+      }
+    } else if (command === "sinter") {
+      // SINTER command - get the intersection of multiple sets
+      // Format: SINTER key [key ...]
+      if (parsed.length >= 2) {
+        const keys = parsed.slice(1);
+        
+        // Start with the first set
+        const firstSet = sets.get(keys[0]);
+        if (!firstSet || firstSet.size === 0) {
+          // If first set doesn't exist or is empty, intersection is empty
+          connection.write("*0\r\n");
+          return;
+        }
+        
+        // Find intersection with all other sets
+        const intersection = new Set<string>();
+        for (const member of firstSet) {
+          let inAllSets = true;
+          
+          // Check if this member is in all other sets
+          for (let i = 1; i < keys.length; i++) {
+            const otherSet = sets.get(keys[i]);
+            if (!otherSet || !otherSet.has(member)) {
+              inAllSets = false;
+              break;
+            }
+          }
+          
+          if (inAllSets) {
+            intersection.add(member);
+          }
+        }
+        
+        // Return the intersection as an array
+        const members = Array.from(intersection);
+        connection.write(encodeArray(members));
+      }
+    } else if (command === "sunion") {
+      // SUNION command - get the union of multiple sets
+      // Format: SUNION key [key ...]
+      if (parsed.length >= 2) {
+        const keys = parsed.slice(1);
+        const union = new Set<string>();
+        
+        // Add all members from all sets to the union
+        for (const key of keys) {
+          const set = sets.get(key);
+          if (set) {
+            for (const member of set) {
+              union.add(member);
+            }
+          }
+        }
+        
+        // Return the union as an array
+        const members = Array.from(union);
+        connection.write(encodeArray(members));
+      }
+    } else if (command === "sdiff") {
+      // SDIFF command - get the difference between first set and all others
+      // Format: SDIFF key [key ...]
+      if (parsed.length >= 2) {
+        const keys = parsed.slice(1);
+        
+        // Start with the first set
+        const firstSet = sets.get(keys[0]);
+        if (!firstSet || firstSet.size === 0) {
+          // If first set doesn't exist or is empty, difference is empty
+          connection.write("*0\r\n");
+          return;
+        }
+        
+        // Create a copy of the first set
+        const difference = new Set<string>(firstSet);
+        
+        // Remove members that exist in any other set
+        for (let i = 1; i < keys.length; i++) {
+          const otherSet = sets.get(keys[i]);
+          if (otherSet) {
+            for (const member of otherSet) {
+              difference.delete(member);
+            }
+          }
+        }
+        
+        // Return the difference as an array
+        const members = Array.from(difference);
+        connection.write(encodeArray(members));
+      }
     } else if (command === "zadd") {
       // ZADD command - add member to sorted set with score
       if (parsed.length >= 4) {
