@@ -557,6 +557,67 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         // Return the entry ID as a bulk string
         connection.write(encodeBulkString(entryId));
       }
+    } else if (command === "xrange") {
+      // XRANGE requires three arguments: stream_key, start_id, end_id
+      if (parsed.length < 4) {
+        connection.write("-ERR wrong number of arguments for 'xrange' command\r\n");
+        return;
+      }
+      
+      const streamKey = parsed[1];
+      const startIdStr = parsed[2];
+      const endIdStr = parsed[3];
+      
+      // Get the stream
+      const stream = streams.get(streamKey);
+      
+      // If stream doesn't exist, return empty array
+      if (!stream) {
+        connection.write("*0\r\n");
+        return;
+      }
+      
+      // Parse start and end IDs
+      // If sequence number is not provided:
+      // - For start ID, default to 0
+      // - For end ID, default to max value (use large number)
+      const startId = parseStreamId(startIdStr, 0);
+      const endId = parseStreamId(endIdStr, Number.MAX_SAFE_INTEGER);
+      
+      // Filter entries within range (inclusive)
+      const results: StreamEntry[] = [];
+      for (const entry of stream) {
+        const entryId = parseStreamId(entry.id, 0);
+        
+        // Check if entry is within range
+        if (compareStreamIds(entryId, startId) >= 0 && compareStreamIds(entryId, endId) <= 0) {
+          results.push(entry);
+        }
+      }
+      
+      // Encode response as RESP array of arrays
+      // Format: [[id, [field1, value1, field2, value2]], ...]
+      let response = `*${results.length}\r\n`;
+      for (const entry of results) {
+        // Each entry is an array of 2 elements: [id, fields_array]
+        response += "*2\r\n";
+        
+        // Element 1: Entry ID as bulk string
+        response += encodeBulkString(entry.id);
+        
+        // Element 2: Array of field-value pairs
+        const fieldValues: string[] = [];
+        for (const [field, value] of entry.fields) {
+          fieldValues.push(field);
+          fieldValues.push(value);
+        }
+        response += `*${fieldValues.length}\r\n`;
+        for (const item of fieldValues) {
+          response += encodeBulkString(item);
+        }
+      }
+      
+      connection.write(response);
     } else if (command === "lrange") {
       // LRANGE requires three arguments: key, start, stop
       if (parsed.length >= 4) {
