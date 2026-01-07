@@ -1387,8 +1387,10 @@ if (serverRole === "slave" && masterHost && masterPort) {
         }
       }
       
-    } else if (handshakeStep === 5 && rdbReceived) {
-      // Process propagated commands
+    }
+    
+    // Process propagated commands (not else-if so it can execute after RDB processing)
+    if (handshakeStep === 5 && rdbReceived) {
       while (dataBuffer.length > 0) {
         const parsed = parseRESP(dataBuffer);
         
