@@ -399,6 +399,40 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         const streamKey = parsed[1];
         let entryId = parsed[2];
         
+        // Check if fully auto-generated ID (*)
+        if (entryId === '*') {
+          // Auto-generate both timestamp and sequence number
+          // Get or create the stream
+          let stream = streams.get(streamKey);
+          if (!stream) {
+            stream = [];
+            streams.set(streamKey, stream);
+          }
+          
+          // Get current Unix time in milliseconds
+          const currentMsTime = Date.now();
+          
+          // Find last entry with same milliseconds time
+          let lastSeqForTime = -1;
+          for (let i = stream.length - 1; i >= 0; i--) {
+            const existingIdParts = stream[i].id.split('-');
+            const existingMsTime = parseInt(existingIdParts[0]);
+            if (existingMsTime === currentMsTime) {
+              lastSeqForTime = parseInt(existingIdParts[1]);
+              break;
+            } else if (existingMsTime < currentMsTime) {
+              // Times are ordered, no need to search further
+              break;
+            }
+          }
+          
+          // Determine sequence number
+          const seqNum = (lastSeqForTime === -1) ? 0 : lastSeqForTime + 1;
+          
+          // Create the entry ID
+          entryId = `${currentMsTime}-${seqNum}`;
+        }
+        
         // Parse entry ID into milliseconds and sequence number
         const idParts = entryId.split('-');
         if (idParts.length !== 2) {
