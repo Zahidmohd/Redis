@@ -397,7 +397,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       // XADD requires at least 4 arguments: stream_key, entry_id, field1, value1, ...
       if (parsed.length >= 4) {
         const streamKey = parsed[1];
-        const entryId = parsed[2];
+        let entryId = parsed[2];
         
         // Parse entry ID into milliseconds and sequence number
         const idParts = entryId.split('-');
@@ -407,7 +407,50 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         }
         
         const msTime = parseInt(idParts[0]);
-        const seqNum = parseInt(idParts[1]);
+        let seqNum: number;
+        
+        // Check if sequence number needs to be auto-generated
+        if (idParts[1] === '*') {
+          // Auto-generate sequence number
+          // Get or create the stream
+          let stream = streams.get(streamKey);
+          if (!stream) {
+            stream = [];
+            streams.set(streamKey, stream);
+          }
+          
+          // Find last entry with same milliseconds time
+          let lastSeqForTime = -1;
+          for (let i = stream.length - 1; i >= 0; i--) {
+            const existingIdParts = stream[i].id.split('-');
+            const existingMsTime = parseInt(existingIdParts[0]);
+            if (existingMsTime === msTime) {
+              lastSeqForTime = parseInt(existingIdParts[1]);
+              break;
+            } else if (existingMsTime < msTime) {
+              // Times are ordered, no need to search further
+              break;
+            }
+          }
+          
+          // Determine sequence number
+          if (lastSeqForTime === -1) {
+            // No entries with this time part exist
+            if (msTime === 0) {
+              seqNum = 1; // Special case: time=0 starts at 1
+            } else {
+              seqNum = 0; // Normal case: starts at 0
+            }
+          } else {
+            // Entries exist, increment last sequence
+            seqNum = lastSeqForTime + 1;
+          }
+          
+          // Update entryId with generated sequence number
+          entryId = `${msTime}-${seqNum}`;
+        } else {
+          seqNum = parseInt(idParts[1]);
+        }
         
         // Check if ID is 0-0 (always invalid)
         if (msTime === 0 && seqNum === 0) {
