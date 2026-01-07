@@ -139,6 +139,23 @@ for (let i = 0; i < cmdArgs.length; i++) {
 const masterReplId = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
 const masterReplOffset = 0;
 
+// Track connected replicas
+const replicas: net.Socket[] = [];
+
+// Helper function to propagate commands to all replicas
+function propagateToReplicas(commandArray: string[]): void {
+  // Build RESP array for the command
+  let resp = `*${commandArray.length}\r\n`;
+  for (const arg of commandArray) {
+    resp += `$${arg.length}\r\n${arg}\r\n`;
+  }
+  
+  // Send to all connected replicas
+  for (const replica of replicas) {
+    replica.write(resp);
+  }
+}
+
 // Helper function to wake up blocked XREAD clients when entries are added to a stream
 function wakeUpBlockedXReadClients(streamKey: string): void {
   // Check all blocked XREAD clients
@@ -398,6 +415,18 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       // Respond with FULLRESYNC <REPL_ID> <OFFSET>
       const response = `+FULLRESYNC ${masterReplId} ${masterReplOffset}\r\n`;
       connection.write(response);
+      
+      // Send empty RDB file
+      // This is an empty RDB file in hex format
+      const emptyRdbHex = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
+      
+      // Convert hex to binary buffer
+      const rdbBuffer = Buffer.from(emptyRdbHex, 'hex');
+      
+      // Send RDB file in format: $<length>\r\n<contents>
+      // Note: No trailing \r\n after contents
+      connection.write(`$${rdbBuffer.length}\r\n`);
+      connection.write(rdbBuffer);
     } else if (command === "multi") {
       // Start a transaction
       transactionState.set(connection, true);
