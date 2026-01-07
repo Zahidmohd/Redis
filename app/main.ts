@@ -154,6 +154,28 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         // Return the length of the list as a RESP integer
         connection.write(encodeInteger(list.length));
       }
+    } else if (command === "lpush") {
+      // LPUSH requires at least two arguments: key and one or more values
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const values = parsed.slice(2); // All values after the key
+        
+        // Get or create the list
+        let list = lists.get(key);
+        if (!list) {
+          list = [];
+          lists.set(key, list);
+        }
+        
+        // Push all values to the left (start) of the list
+        // Elements are prepended in order, so they appear in reverse
+        for (const value of values) {
+          list.unshift(value);
+        }
+        
+        // Return the length of the list as a RESP integer
+        connection.write(encodeInteger(list.length));
+      }
     } else if (command === "lrange") {
       // LRANGE requires three arguments: key, start, stop
       if (parsed.length >= 4) {
