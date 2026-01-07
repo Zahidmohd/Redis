@@ -41,6 +41,11 @@ function encodeBulkString(str: string | null): string {
   return `$${str.length}\r\n${str}\r\n`;
 }
 
+// Encode an integer as a RESP integer
+function encodeInteger(num: number): string {
+  return `:${num}\r\n`;
+}
+
 // In-memory storage for key-value pairs with expiry
 interface StoredValue {
   value: string;
@@ -48,6 +53,9 @@ interface StoredValue {
 }
 
 const store = new Map<string, StoredValue>();
+
+// In-memory storage for lists
+const lists = new Map<string, string[]>();
 
 const server: net.Server = net.createServer((connection: net.Socket) => {
   // Handle connection
@@ -117,6 +125,25 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           // Key doesn't exist
           connection.write(encodeBulkString(null));
         }
+      }
+    } else if (command === "rpush") {
+      // RPUSH requires at least two arguments: key and one or more values
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const values = parsed.slice(2); // All values after the key
+        
+        // Get or create the list
+        let list = lists.get(key);
+        if (!list) {
+          list = [];
+          lists.set(key, list);
+        }
+        
+        // Push all values to the right (end) of the list
+        list.push(...values);
+        
+        // Return the length of the list as a RESP integer
+        connection.write(encodeInteger(list.length));
       }
     }
   });
