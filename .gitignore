@@ -1,14 +1,14 @@
 node_modules/
 package-lock.json
-project_plan.md
-OPTIMISTIC_LOCKING.md
-IMPLEMENTATION_NOTES.md
-RESP3_IMPLEMENTATION.md
-BLOOM_FILTERS.md
+
+# Ignore all markdown files except README.md
+*.md
+!README.md
+
+# Test scripts (temporary)
 test_optimistic_locking.sh
 test_watch_simple.sh
 verify_watch.sh
 test_concurrent_watch.ts
 test_concurrent_watch.js
 app/main.js
-implementation_summary.md

@@ -1,10 +1,27 @@
+/**
+ * Redis Server Implementation in TypeScript
+ * 
+ * A comprehensive Redis clone supporting:
+ * - RESP2 and RESP3 protocols
+ * - Multiple data types: Strings, Lists, Sets, Hashes, Sorted Sets, Streams, Bloom Filters
+ * - Advanced features: Optimistic Locking (WATCH/MULTI/EXEC), Lua Scripting, Pub/Sub
+ * - Persistence: RDB loading, AOF with configurable fsync policies
+ * - Geospatial commands with geohash encoding
+ * - ACL authentication and authorization
+ * - Master-replica replication
+ * - Command introspection and metadata
+ * 
+ * Built as part of CodeCrafters "Build Your Own Redis" Challenge
+ * Runtime: Bun 1.2+
+ * Protocol: Redis Serialization Protocol (RESP2/RESP3)
+ */
+
 import * as net from "net";
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
 
-// You can use print statements as follows for debugging, they'll be visible when running tests.
-console.log("Logs from your program will appear here!");
+console.log("🚀 Redis Server Starting...");
 
 // RESP Parser - parses Redis Protocol messages
 function parseRESP(data: Buffer): string[] | null {
@@ -4407,7 +4424,16 @@ const PORT = Number(process.env.PORT) || serverPort;
 
 if (import.meta.main) {
   server.listen(PORT, "127.0.0.1", () => {
-    console.log(`Redis server listening on port ${PORT} as ${serverRole}`);
+    console.log(`\n${"=".repeat(60)}`);
+    console.log(`🚀 Redis Server Ready!`);
+    console.log(`${"=".repeat(60)}`);
+    console.log(`📍 Address: 127.0.0.1:${PORT}`);
+    console.log(`🎭 Role: ${serverRole}`);
+    console.log(`📁 RDB: ${configDir}/${configDbfilename}`);
+    console.log(`💾 AOF: ${appendonly ? "Enabled" : "Disabled"} (${appendfilename})`);
+    console.log(`🔒 Protocol: RESP2/RESP3 (auto-negotiate)`);
+    console.log(`${"=".repeat(60)}\n`);
+    console.log(`Ready to accept connections. Press Ctrl+C to stop.\n`);
   });
 }
 
