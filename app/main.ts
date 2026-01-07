@@ -623,6 +623,81 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       }
       
       connection.write(response);
+    } else if (command === "xread") {
+      // XREAD STREAMS <key1> <id1> [<key2> <id2> ...]
+      // Find the STREAMS keyword
+      let streamsIndex = -1;
+      for (let i = 1; i < parsed.length; i++) {
+        if (parsed[i].toLowerCase() === 'streams') {
+          streamsIndex = i;
+          break;
+        }
+      }
+      
+      if (streamsIndex === -1 || parsed.length < streamsIndex + 3) {
+        connection.write("-ERR wrong number of arguments for 'xread' command\r\n");
+        return;
+      }
+      
+      // For now, handle single stream (first key-id pair after STREAMS)
+      const streamKey = parsed[streamsIndex + 1];
+      const afterIdStr = parsed[streamsIndex + 2];
+      
+      // Get the stream
+      const stream = streams.get(streamKey);
+      
+      // If stream doesn't exist, return empty array
+      if (!stream) {
+        connection.write("*0\r\n");
+        return;
+      }
+      
+      // Parse the ID to search after
+      const afterId = parseStreamId(afterIdStr, 0);
+      
+      // Filter entries with ID > afterId (exclusive)
+      const results: StreamEntry[] = [];
+      for (const entry of stream) {
+        const entryId = parseStreamId(entry.id, 0);
+        
+        // Check if entry ID is greater than afterId (exclusive)
+        if (compareStreamIds(entryId, afterId) > 0) {
+          results.push(entry);
+        }
+      }
+      
+      // Encode response as RESP nested array
+      // Format: [[stream_key, [[id, [field, value, ...]], ...]], ...]
+      let response = "*1\r\n"; // Array of 1 stream
+      
+      // Stream element: [stream_key, entries_array]
+      response += "*2\r\n";
+      
+      // Element 1: Stream key as bulk string
+      response += encodeBulkString(streamKey);
+      
+      // Element 2: Array of entries
+      response += `*${results.length}\r\n`;
+      for (const entry of results) {
+        // Each entry is [id, [field1, value1, ...]]
+        response += "*2\r\n";
+        
+        // Entry ID
+        response += encodeBulkString(entry.id);
+        
+        // Fields array
+        const fieldValues: string[] = [];
+        for (const [field, value] of entry.fields) {
+          fieldValues.push(field);
+          fieldValues.push(value);
+        }
+        response += `*${fieldValues.length}\r\n`;
+        for (const item of fieldValues) {
+          response += encodeBulkString(item);
+        }
+      }
+      
+      connection.write(response);
     } else if (command === "lrange") {
       // LRANGE requires three arguments: key, start, stop
       if (parsed.length >= 4) {
