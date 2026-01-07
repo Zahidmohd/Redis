@@ -388,6 +388,10 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         // Other sections not implemented yet
         connection.write(encodeBulkString(""));
       }
+    } else if (command === "replconf") {
+      // REPLCONF command - used during replication handshake
+      // For now, we just acknowledge with OK regardless of arguments
+      connection.write("+OK\r\n");
     } else if (command === "multi") {
       // Start a transaction
       transactionState.set(connection, true);
