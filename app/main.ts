@@ -190,6 +190,26 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           connection.write(encodeInteger(list.length));
         }
       }
+    } else if (command === "lpop") {
+      // LPOP requires one argument: key
+      if (parsed.length >= 2) {
+        const key = parsed[1];
+        const list = lists.get(key);
+        
+        // If list doesn't exist or is empty, return null bulk string
+        if (!list || list.length === 0) {
+          connection.write(encodeBulkString(null));
+        } else {
+          // Remove and return the first element
+          const element = list.shift();
+          connection.write(encodeBulkString(element!));
+          
+          // Clean up empty list
+          if (list.length === 0) {
+            lists.delete(key);
+          }
+        }
+      }
     } else if (command === "lrange") {
       // LRANGE requires three arguments: key, start, stop
       if (parsed.length >= 4) {
