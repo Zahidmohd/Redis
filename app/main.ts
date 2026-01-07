@@ -410,6 +410,14 @@ let masterPort: number | null = null;
 let configDir = "/tmp/redis-data"; // Default directory
 let configDbfilename = "dump.rdb"; // Default filename
 
+// AOF configuration
+let appendonly = false; // AOF disabled by default
+let appendfilename = "appendonly.aof"; // Default AOF filename
+let appendfsync: "always" | "everysec" | "no" = "everysec"; // Sync policy
+let aofFileDescriptor: number | null = null; // File descriptor for AOF file
+let aofBuffer: string[] = []; // Buffer for AOF writes
+let lastAOFSync = Date.now(); // Last time AOF was synced
+
 const cmdArgs = process.argv.slice(2); // Skip 'node' and script name
 for (let i = 0; i < cmdArgs.length; i++) {
   if (cmdArgs[i] === '--port' && i + 1 < cmdArgs.length) {
@@ -484,6 +492,200 @@ function readString(buffer: Buffer, offset: number): { value: string, bytesRead:
   // Regular string - length-prefixed
   const strValue = buffer.toString('utf8', currentOffset, currentOffset + lengthInfo.value);
   return { value: strValue, bytesRead: lengthInfo.bytesRead + lengthInfo.value };
+}
+
+// AOF Functions
+
+// Append a command to the AOF file
+function appendToAOF(commandArray: string[]): void {
+  if (!appendonly) {
+    return; // AOF is disabled
+  }
+  
+  // Build RESP array for the command
+  let resp = `*${commandArray.length}\r\n`;
+  for (const arg of commandArray) {
+    resp += `$${arg.length}\r\n${arg}\r\n`;
+  }
+  
+  // Add to buffer
+  aofBuffer.push(resp);
+  
+  // Handle different sync modes
+  if (appendfsync === "always") {
+    // Sync immediately
+    flushAOF();
+  } else if (appendfsync === "everysec") {
+    // Sync every second (handled by interval timer)
+    const now = Date.now();
+    if (now - lastAOFSync >= 1000) {
+      flushAOF();
+    }
+  }
+  // "no" mode: let OS decide when to sync
+}
+
+// Flush AOF buffer to disk
+function flushAOF(): void {
+  if (aofBuffer.length === 0) {
+    return;
+  }
+  
+  try {
+    // Open AOF file if not already open
+    if (aofFileDescriptor === null) {
+      const aofPath = `${configDir}/${appendfilename}`;
+      // Create directory if it doesn't exist
+      if (!fs.existsSync(configDir)) {
+        fs.mkdirSync(configDir, { recursive: true });
+      }
+      // Open file in append mode
+      aofFileDescriptor = fs.openSync(aofPath, 'a');
+    }
+    
+    // Write all buffered commands
+    const data = aofBuffer.join('');
+    fs.writeSync(aofFileDescriptor, data);
+    
+    // Sync to disk
+    fs.fsyncSync(aofFileDescriptor);
+    
+    // Clear buffer
+    aofBuffer = [];
+    lastAOFSync = Date.now();
+  } catch (error) {
+    console.error(`Error writing to AOF file: ${error}`);
+  }
+}
+
+// Load and replay commands from AOF file
+function loadAOF(): void {
+  if (!appendonly) {
+    return; // AOF is disabled
+  }
+  
+  const aofPath = `${configDir}/${appendfilename}`;
+  
+  // Check if file exists
+  if (!fs.existsSync(aofPath)) {
+    console.log(`AOF file not found at ${aofPath}, starting with empty database`);
+    return;
+  }
+  
+  try {
+    const data = fs.readFileSync(aofPath);
+    console.log(`Loading AOF file from ${aofPath} (${data.length} bytes)`);
+    
+    let offset = 0;
+    let commandsLoaded = 0;
+    
+    // Parse and replay commands
+    while (offset < data.length) {
+      const parsed = parseRESP(data.slice(offset));
+      
+      if (!parsed || parsed.length === 0) {
+        break;
+      }
+      
+      // Execute the command
+      const command = parsed[0].toLowerCase();
+      
+      // Execute write commands
+      if (command === "set" && parsed.length >= 3) {
+        const key = parsed[1];
+        const value = parsed[2];
+        let expiresAt: number | undefined = undefined;
+        
+        for (let i = 3; i < parsed.length; i += 2) {
+          const option = parsed[i]?.toLowerCase();
+          const optionValue = parsed[i + 1];
+          if (option === "px" && optionValue) {
+            expiresAt = Date.now() + parseInt(optionValue);
+          } else if (option === "ex" && optionValue) {
+            expiresAt = Date.now() + parseInt(optionValue) * 1000;
+          }
+        }
+        
+        store.set(key, { value, expiresAt });
+        incrementKeyVersion(key);
+      } else if (command === "del" && parsed.length >= 2) {
+        for (let i = 1; i < parsed.length; i++) {
+          store.delete(parsed[i]);
+          lists.delete(parsed[i]);
+          streams.delete(parsed[i]);
+          sortedSets.delete(parsed[i]);
+          sets.delete(parsed[i]);
+          bloomFilters.delete(parsed[i]);
+          incrementKeyVersion(parsed[i]);
+        }
+      } else if (command === "sadd" && parsed.length >= 3) {
+        const key = parsed[1];
+        let set = sets.get(key);
+        if (!set) {
+          set = new Set<string>();
+          sets.set(key, set);
+        }
+        for (let i = 2; i < parsed.length; i++) {
+          set.add(parsed[i]);
+        }
+        incrementKeyVersion(key);
+      } else if (command === "lpush" && parsed.length >= 3) {
+        const key = parsed[1];
+        let list = lists.get(key);
+        if (!list) {
+          list = [];
+          lists.set(key, list);
+        }
+        for (let i = 2; i < parsed.length; i++) {
+          list.unshift(parsed[i]);
+        }
+        incrementKeyVersion(key);
+      } else if (command === "rpush" && parsed.length >= 3) {
+        const key = parsed[1];
+        let list = lists.get(key);
+        if (!list) {
+          list = [];
+          lists.set(key, list);
+        }
+        for (let i = 2; i < parsed.length; i++) {
+          list.push(parsed[i]);
+        }
+        incrementKeyVersion(key);
+      }
+      // Add more commands as needed
+      
+      commandsLoaded++;
+      
+      // Calculate bytes consumed to move offset
+      const message = data.slice(offset).toString();
+      const lines = message.split('\r\n');
+      const numElements = parseInt(lines[0].substring(1));
+      let consumed = lines[0].length + 2; // First line + \r\n
+      
+      for (let i = 0; i < numElements; i++) {
+        const lineIdx = 1 + i * 2;
+        if (lineIdx >= lines.length) break;
+        const bulkLength = parseInt(lines[lineIdx].substring(1));
+        consumed += lines[lineIdx].length + 2; // Length line + \r\n
+        consumed += bulkLength + 2; // Data + \r\n
+      }
+      
+      offset += consumed;
+    }
+    
+    console.log(`Loaded ${commandsLoaded} commands from AOF file`);
+  } catch (error) {
+    console.error(`Error loading AOF file: ${error}`);
+  }
+}
+
+// Set up AOF sync interval for "everysec" mode
+if (appendonly && appendfsync === "everysec") {
+  setInterval(() => {
+    if (Date.now() - lastAOFSync >= 1000) {
+      flushAOF();
+    }
+  }, 1000);
 }
 
 // Function to read RDB file and load data
@@ -620,8 +822,13 @@ function loadRDBFile() {
   }
 }
 
-// Load RDB file on startup
-loadRDBFile();
+// Load RDB file on startup (if AOF is disabled)
+if (!appendonly) {
+  loadRDBFile();
+} else {
+  // If AOF is enabled, load from AOF instead (it's more recent)
+  loadAOF();
+}
 
 // Replication ID and offset (for master servers)
 const masterReplId = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
@@ -967,7 +1174,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         connection.write(encodeBulkString(""));
       }
     } else if (command === "config") {
-      // CONFIG command - for now only handle CONFIG GET
+      // CONFIG command
       if (parsed.length >= 3 && parsed[1].toLowerCase() === "get") {
         const parameter = parsed[2].toLowerCase();
         
@@ -979,12 +1186,52 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           response += encodeBulkString(configDir);
         } else if (parameter === "dbfilename") {
           response += encodeBulkString(configDbfilename);
+        } else if (parameter === "appendonly") {
+          response += encodeBulkString(appendonly ? "yes" : "no");
+        } else if (parameter === "appendfilename") {
+          response += encodeBulkString(appendfilename);
+        } else if (parameter === "appendfsync") {
+          response += encodeBulkString(appendfsync);
         } else {
           // Unknown parameter - return empty value
           response += encodeBulkString("");
         }
         
         connection.write(response);
+      } else if (parsed.length >= 4 && parsed[1].toLowerCase() === "set") {
+        // CONFIG SET parameter value
+        const parameter = parsed[2].toLowerCase();
+        const value = parsed[3];
+        
+        if (parameter === "appendonly") {
+          const newValue = value.toLowerCase() === "yes";
+          if (newValue && !appendonly) {
+            // Enabling AOF - open file
+            appendonly = true;
+            flushAOF(); // Ensure file is created
+          } else if (!newValue && appendonly) {
+            // Disabling AOF - close file
+            appendonly = false;
+            if (aofFileDescriptor !== null) {
+              flushAOF(); // Flush remaining data
+              fs.closeSync(aofFileDescriptor);
+              aofFileDescriptor = null;
+            }
+          }
+          connection.write("+OK\r\n");
+        } else if (parameter === "appendfilename") {
+          appendfilename = value;
+          connection.write("+OK\r\n");
+        } else if (parameter === "appendfsync") {
+          if (value === "always" || value === "everysec" || value === "no") {
+            appendfsync = value as "always" | "everysec" | "no";
+            connection.write("+OK\r\n");
+          } else {
+            connection.write("-ERR invalid appendfsync value\r\n");
+          }
+        } else {
+          connection.write("-ERR unsupported CONFIG parameter\r\n");
+        }
       }
     } else if (command === "acl") {
       // ACL command - Access Control List management
@@ -1315,6 +1562,78 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         watchedKeyVersions.delete(connection);
         connection.write("+OK\r\n");
       }
+    } else if (command === "bgrewriteaof") {
+      // BGREWRITEAOF command - rewrite AOF file to minimize size
+      if (!appendonly) {
+        connection.write("-ERR AOF is not enabled\r\n");
+        return;
+      }
+      
+      try {
+        // Flush current AOF buffer first
+        flushAOF();
+        
+        // Create new AOF file with current state
+        const tempAofPath = `${configDir}/${appendfilename}.temp`;
+        const tempFd = fs.openSync(tempAofPath, 'w');
+        
+        // Write all current data as commands
+        const commands: string[] = [];
+        
+        // Write all strings
+        for (const [key, storedValue] of store.entries()) {
+          if (!storedValue.expiresAt || storedValue.expiresAt > Date.now()) {
+            let cmd = `*3\r\n$3\r\nSET\r\n$${key.length}\r\n${key}\r\n$${storedValue.value.length}\r\n${storedValue.value}\r\n`;
+            commands.push(cmd);
+          }
+        }
+        
+        // Write all sets
+        for (const [key, set] of sets.entries()) {
+          if (set.size > 0) {
+            const members = Array.from(set);
+            let cmd = `*${2 + members.length}\r\n$4\r\nSADD\r\n$${key.length}\r\n${key}\r\n`;
+            for (const member of members) {
+              cmd += `$${member.length}\r\n${member}\r\n`;
+            }
+            commands.push(cmd);
+          }
+        }
+        
+        // Write all lists
+        for (const [key, list] of lists.entries()) {
+          if (list.length > 0) {
+            let cmd = `*${2 + list.length}\r\n$5\r\nRPUSH\r\n$${key.length}\r\n${key}\r\n`;
+            for (const item of list) {
+              cmd += `$${item.length}\r\n${item}\r\n`;
+            }
+            commands.push(cmd);
+          }
+        }
+        
+        // Write commands to temp file
+        const data = commands.join('');
+        fs.writeSync(tempFd, data);
+        fs.fsyncSync(tempFd);
+        fs.closeSync(tempFd);
+        
+        // Close current AOF file
+        if (aofFileDescriptor !== null) {
+          fs.closeSync(aofFileDescriptor);
+          aofFileDescriptor = null;
+        }
+        
+        // Rename temp file to actual AOF file
+        const aofPath = `${configDir}/${appendfilename}`;
+        fs.renameSync(tempAofPath, aofPath);
+        
+        // Reopen AOF file
+        aofFileDescriptor = fs.openSync(aofPath, 'a');
+        
+        connection.write("+Background append only file rewriting started\r\n");
+      } catch (error) {
+        connection.write(`-ERR failed to rewrite AOF: ${error}\r\n`);
+      }
     } else if (command === "wait") {
       // WAIT <numreplicas> <timeout>
       if (parsed.length >= 3) {
@@ -1500,6 +1819,9 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         }
         
         incrementKeyVersion(key); // Track modification for WATCH
+        
+        // Log to AOF
+        appendToAOF(parsed);
         
         // Return the number of new members added
         connection.write(encodeInteger(addedCount));
@@ -2287,6 +2609,10 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         
         store.set(key, { value, expiresAt });
         incrementKeyVersion(key); // Track modification for WATCH
+        
+        // Log to AOF
+        appendToAOF(parsed);
+        
         connection.write("+OK\r\n");
         
         // Propagate write command to replicas
