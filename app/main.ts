@@ -58,6 +58,42 @@ function encodeArray(items: string[]): string {
   return result;
 }
 
+// RESP3 encoding functions
+function encodeRESP3Null(): string {
+  return "_\r\n";
+}
+
+function encodeRESP3Boolean(value: boolean): string {
+  return value ? "#t\r\n" : "#f\r\n";
+}
+
+function encodeRESP3Double(num: number): string {
+  return `,${num}\r\n`;
+}
+
+function encodeRESP3Map(map: Map<string, string>): string {
+  let result = `%${map.size}\r\n`;
+  for (const [key, value] of map) {
+    result += encodeBulkString(key);
+    result += encodeBulkString(value);
+  }
+  return result;
+}
+
+function encodeRESP3Set(items: string[]): string {
+  let result = `~${items.length}\r\n`;
+  for (const item of items) {
+    result += encodeBulkString(item);
+  }
+  return result;
+}
+
+// Helper to encode null based on protocol version
+function encodeNull(connection: net.Socket): string {
+  const version = protocolVersion.get(connection) || 2;
+  return version === 3 ? encodeRESP3Null() : encodeBulkString(null);
+}
+
 // Helper function to parse stream entry ID (handles optional sequence number)
 function parseStreamId(id: string, defaultSeq: number): { msTime: number; seqNum: number } {
   const parts = id.split('-');
@@ -261,6 +297,9 @@ const keyVersions = new Map<string, number>();
 
 // Authenticated user per connection (null = not authenticated)
 const authenticatedUser = new Map<net.Socket, string | null>();
+
+// Protocol version per connection (2 = RESP2, 3 = RESP3)
+const protocolVersion = new Map<net.Socket, number>();
 
 // Parse command-line arguments
 let serverPort = 6379; // Default port
@@ -736,6 +775,9 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
     authenticatedUser.set(connection, null);  // Not authenticated
   }
   
+  // Initialize protocol version (default to RESP2)
+  protocolVersion.set(connection, 2);
+  
   // Handle connection
   connection.on("data", (data: Buffer) => {
     const parsed = parseRESP(data);
@@ -861,7 +903,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         if (!user) {
           // User not found - for now just return empty response
           // In real Redis, this would return an error
-          connection.write("$-1\r\n");
+          connection.write(encodeNull(connection));
           return;
         }
         
@@ -922,6 +964,80 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         
         // Return OK
         connection.write("+OK\r\n");
+      }
+    } else if (command === "hello") {
+      // HELLO command - protocol negotiation and connection info
+      // Format: HELLO [protover [AUTH username password] [SETNAME clientname]]
+      let requestedVersion = 2; // Default to RESP2
+      let authUsername: string | null = null;
+      let authPassword: string | null = null;
+      
+      if (parsed.length >= 2) {
+        requestedVersion = parseInt(parsed[1]);
+      }
+      
+      // Parse optional AUTH argument
+      for (let i = 2; i < parsed.length; i++) {
+        if (parsed[i].toLowerCase() === "auth" && i + 2 < parsed.length) {
+          authUsername = parsed[i + 1];
+          authPassword = parsed[i + 2];
+          i += 2;
+        }
+      }
+      
+      // Validate protocol version (Redis supports 2 and 3)
+      if (requestedVersion !== 2 && requestedVersion !== 3) {
+        connection.write("-NOPROTO unsupported protocol version\r\n");
+        return;
+      }
+      
+      // Handle authentication if provided
+      if (authUsername && authPassword) {
+        const user = users.get(authUsername);
+        if (!user) {
+          connection.write("-WRONGPASS invalid username-password pair or user is disabled.\r\n");
+          return;
+        }
+        
+        const passwordHash = crypto.createHash("sha256").update(authPassword).digest("hex");
+        if (!user.passwords.includes(passwordHash)) {
+          connection.write("-WRONGPASS invalid username-password pair or user is disabled.\r\n");
+          return;
+        }
+        
+        // Authentication successful
+        authenticatedUser.set(connection, authUsername);
+      }
+      
+      // Set protocol version for this connection
+      protocolVersion.set(connection, requestedVersion);
+      
+      // Build response based on requested protocol version
+      if (requestedVersion === 3) {
+        // RESP3: Return a map
+        const responseMap = new Map<string, string>();
+        responseMap.set("server", "redis");
+        responseMap.set("version", "7.2.0");
+        responseMap.set("proto", "3");
+        responseMap.set("id", "1");
+        responseMap.set("mode", serverRole === "master" ? "standalone" : "replica");
+        responseMap.set("role", serverRole);
+        responseMap.set("modules", "");
+        
+        connection.write(encodeRESP3Map(responseMap));
+      } else {
+        // RESP2: Return an array
+        const response: string[] = [
+          "server", "redis",
+          "version", "7.2.0",
+          "proto", "2",
+          "id", "1",
+          "mode", serverRole === "master" ? "standalone" : "replica",
+          "role", serverRole,
+          "modules", ""
+        ];
+        
+        connection.write(encodeArray(response));
       }
     } else if (command === "auth") {
       // AUTH command - authenticates the connection with a username and password
@@ -1069,7 +1185,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         
         if (transactionAborted) {
           // Return null bulk string to indicate transaction was aborted
-          connection.write("$-1\r\n");
+          connection.write(encodeNull(connection));
         } else {
           // Execute all queued commands and collect responses
           const responses: string[] = [];
@@ -1333,7 +1449,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         const sortedSet = sortedSets.get(key);
         if (!sortedSet) {
           // Sorted set doesn't exist
-          connection.write("$-1\r\n");
+          connection.write(encodeNull(connection));
           return;
         }
         
@@ -1342,7 +1458,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         
         if (memberIndex === -1) {
           // Member doesn't exist
-          connection.write("$-1\r\n");
+          connection.write(encodeNull(connection));
         } else {
           // Return the rank (0-based index)
           connection.write(encodeInteger(memberIndex));
@@ -1429,7 +1545,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         const sortedSet = sortedSets.get(key);
         if (!sortedSet) {
           // Sorted set doesn't exist - return null bulk string
-          connection.write("$-1\r\n");
+          connection.write(encodeNull(connection));
           return;
         }
         
@@ -1438,7 +1554,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         
         if (!foundMember) {
           // Member doesn't exist - return null bulk string
-          connection.write("$-1\r\n");
+          connection.write(encodeNull(connection));
         } else {
           // Return the score as a bulk string
           const scoreStr = foundMember.score.toString();
@@ -1600,7 +1716,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         
         if (!sortedSet) {
           // Key doesn't exist - return null
-          connection.write("$-1\r\n");
+          connection.write(encodeNull(connection));
           return;
         }
         
@@ -1610,7 +1726,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         
         if (!foundMember1 || !foundMember2) {
           // One or both members don't exist - return null
-          connection.write("$-1\r\n");
+          connection.write(encodeNull(connection));
           return;
         }
         
@@ -1740,14 +1856,14 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           if (storedValue.expiresAt && Date.now() > storedValue.expiresAt) {
             // Key has expired, delete it and return null
             store.delete(key);
-            connection.write(encodeBulkString(null));
+            connection.write(encodeNull(connection));
           } else {
             // Key is valid, return the value
             connection.write(encodeBulkString(storedValue.value));
           }
         } else {
           // Key doesn't exist
-          connection.write(encodeBulkString(null));
+          connection.write(encodeNull(connection));
         }
       }
     } else if (command === "incr") {
@@ -2446,6 +2562,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
     watchedKeyVersions.delete(connection);
     subscriptions.delete(connection);
     authenticatedUser.delete(connection);
+    protocolVersion.delete(connection);
     
     // Remove from replicas list if this was a replica connection
     const replicaIndex = replicas.indexOf(connection);

@@ -1,8 +1,10 @@
 node_modules/
 package-lock.json
+bun.lockb
 project_plan.md
 OPTIMISTIC_LOCKING.md
 IMPLEMENTATION_NOTES.md
+RESP3_IMPLEMENTATION.md
 test_optimistic_locking.sh
 test_watch_simple.sh
 verify_watch.sh
