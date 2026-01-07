@@ -34,9 +34,15 @@ function parseRESP(data: Buffer): string[] | null {
 }
 
 // Encode a string as a RESP bulk string
-function encodeBulkString(str: string): string {
+function encodeBulkString(str: string | null): string {
+  if (str === null) {
+    return "$-1\r\n"; // Null bulk string
+  }
   return `$${str.length}\r\n${str}\r\n`;
 }
+
+// In-memory storage for key-value pairs
+const store = new Map<string, string>();
 
 const server: net.Server = net.createServer((connection: net.Socket) => {
   // Handle connection
@@ -57,6 +63,21 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       if (parsed.length >= 2) {
         const message = parsed[1];
         connection.write(encodeBulkString(message));
+      }
+    } else if (command === "set") {
+      // SET requires two arguments: key and value
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const value = parsed[2];
+        store.set(key, value);
+        connection.write("+OK\r\n");
+      }
+    } else if (command === "get") {
+      // GET requires one argument: key
+      if (parsed.length >= 2) {
+        const key = parsed[1];
+        const value = store.get(key);
+        connection.write(encodeBulkString(value ?? null));
       }
     }
   });
