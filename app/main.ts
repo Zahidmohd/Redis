@@ -73,83 +73,90 @@ function compareStreamIds(id1: { msTime: number; seqNum: number }, id2: { msTime
   return id1.seqNum - id2.seqNum;
 }
 
+// Helper function to spread 32-bit integer to 64-bit with interleaved zeros
+function spread32BitsTo64Bits(v: number): bigint {
+  let result = BigInt(v) & 0xFFFFFFFFn;
+  result = (result | (result << 16n)) & 0x0000FFFF0000FFFFn;
+  result = (result | (result << 8n)) & 0x00FF00FF00FF00FFn;
+  result = (result | (result << 4n)) & 0x0F0F0F0F0F0F0F0Fn;
+  result = (result | (result << 2n)) & 0x3333333333333333n;
+  result = (result | (result << 1n)) & 0x5555555555555555n;
+  return result;
+}
+
+// Helper function to interleave bits of x and y
+function interleaveBits(x: number, y: number): bigint {
+  const xSpread = spread32BitsTo64Bits(x);
+  const ySpread = spread32BitsTo64Bits(y);
+  const yShifted = ySpread << 1n;
+  return xSpread | yShifted;
+}
+
 // Helper function to encode geohash from longitude and latitude
 function encodeGeohash(longitude: number, latitude: number): number {
-  // Longitude range: -180 to +180
-  const lonMin = -180.0;
-  const lonMax = 180.0;
+  // Constants from Redis geohash implementation
+  const ENCODE_MIN_LATITUDE = -85.05112878;
+  const ENCODE_MAX_LATITUDE = 85.05112878;
+  const ENCODE_MIN_LONGITUDE = -180.0;
+  const ENCODE_MAX_LONGITUDE = 180.0;
   
-  // Latitude range: -85.05112878 to +85.05112878 (Web Mercator limits)
-  const latMin = -85.05112878;
-  const latMax = 85.05112878;
+  const ENCODE_LATITUDE_RANGE = ENCODE_MAX_LATITUDE - ENCODE_MIN_LATITUDE;
+  const ENCODE_LONGITUDE_RANGE = ENCODE_MAX_LONGITUDE - ENCODE_MIN_LONGITUDE;
   
-  // Normalize longitude to [0, 1]
-  const lonNormalized = (longitude - lonMin) / (lonMax - lonMin);
+  // Normalize to the range 0-2^26
+  const normalizedLatitude = Math.pow(2, 26) * (latitude - ENCODE_MIN_LATITUDE) / ENCODE_LATITUDE_RANGE;
+  const normalizedLongitude = Math.pow(2, 26) * (longitude - ENCODE_MIN_LONGITUDE) / ENCODE_LONGITUDE_RANGE;
   
-  // Normalize latitude to [0, 1]
-  const latNormalized = (latitude - latMin) / (latMax - latMin);
+  // Truncate to integers
+  const latInt = Math.floor(normalizedLatitude);
+  const lonInt = Math.floor(normalizedLongitude);
   
-  // Convert normalized values to 26-bit integers (for 52-bit total precision)
-  // Use 2^26 (not 2^26 - 1) and clamp to ensure we stay within 26 bits
-  const lonBits = Math.min(Math.floor(lonNormalized * 0x4000000), 0x3FFFFFF); // 2^26 = 67108864
-  const latBits = Math.min(Math.floor(latNormalized * 0x4000000), 0x3FFFFFF);
-  
-  // Interleave the bits: longitude bits at even positions, latitude bits at odd positions
-  // Use arithmetic instead of bitwise operations to handle 52-bit numbers
-  let geohash = 0;
-  for (let i = 0; i < 26; i++) {
-    // Extract bit i from longitude and place at position 2*i
-    const lonBit = (lonBits >> i) & 1;
-    if (lonBit) {
-      geohash += Math.pow(2, 2 * i);
-    }
-    
-    // Extract bit i from latitude and place at position 2*i + 1
-    const latBit = (latBits >> i) & 1;
-    if (latBit) {
-      geohash += Math.pow(2, 2 * i + 1);
-    }
-  }
-  
-  return geohash;
+  // Interleave bits and return as number
+  const geohashBigInt = interleaveBits(latInt, lonInt);
+  return Number(geohashBigInt);
+}
+
+// Helper function to compact 64-bit with interleaved bits back to 32-bit
+function decodeCompactInt64ToInt32(v: bigint): number {
+  v = v & 0x5555555555555555n;
+  v = (v | (v >> 1n)) & 0x3333333333333333n;
+  v = (v | (v >> 2n)) & 0x0F0F0F0F0F0F0F0Fn;
+  v = (v | (v >> 4n)) & 0x00FF00FF00FF00FFn;
+  v = (v | (v >> 8n)) & 0x0000FFFF0000FFFFn;
+  v = (v | (v >> 16n)) & 0x00000000FFFFFFFFn;
+  return Number(v);
 }
 
 // Helper function to decode geohash back to longitude and latitude
 function decodeGeohash(geohash: number): { longitude: number, latitude: number } {
-  // De-interleave the bits to extract longitude and latitude
-  // Use arithmetic instead of bitwise operations for 52-bit numbers
-  let lonBits = 0;
-  let latBits = 0;
+  // Constants from Redis geohash implementation
+  const DECODE_MIN_LATITUDE = -85.05112878;
+  const DECODE_MAX_LATITUDE = 85.05112878;
+  const DECODE_MIN_LONGITUDE = -180.0;
+  const DECODE_MAX_LONGITUDE = 180.0;
   
-  for (let i = 0; i < 26; i++) {
-    // Extract longitude bit from even position (2*i)
-    const lonBitPosition = 2 * i;
-    const lonBit = Math.floor(geohash / Math.pow(2, lonBitPosition)) % 2;
-    if (lonBit) {
-      lonBits += Math.pow(2, i);
-    }
-    
-    // Extract latitude bit from odd position (2*i + 1)
-    const latBitPosition = 2 * i + 1;
-    const latBit = Math.floor(geohash / Math.pow(2, latBitPosition)) % 2;
-    if (latBit) {
-      latBits += Math.pow(2, i);
-    }
-  }
+  const DECODE_LATITUDE_RANGE = DECODE_MAX_LATITUDE - DECODE_MIN_LATITUDE;
+  const DECODE_LONGITUDE_RANGE = DECODE_MAX_LONGITUDE - DECODE_MIN_LONGITUDE;
   
-  // Convert from 26-bit integers back to normalized [0, 1]
-  // Use 2^26 (not 2^26 - 1) to match the encoding
-  const lonNormalized = lonBits / 0x4000000;
-  const latNormalized = latBits / 0x4000000;
+  const geoCode = BigInt(geohash);
   
-  // Denormalize to original ranges
-  const lonMin = -180.0;
-  const lonMax = 180.0;
-  const latMin = -85.05112878;
-  const latMax = 85.05112878;
+  // Align bits of both latitude and longitude to take even-numbered position
+  const y = geoCode >> 1n;
+  const x = geoCode;
   
-  const longitude = lonMin + (lonNormalized * (lonMax - lonMin));
-  const latitude = latMin + (latNormalized * (latMax - latMin));
+  // Compact bits back to 32-bit ints
+  const gridLatitudeNumber = decodeCompactInt64ToInt32(x);
+  const gridLongitudeNumber = decodeCompactInt64ToInt32(y);
+  
+  // Calculate the grid boundaries
+  const gridLatitudeMin = DECODE_MIN_LATITUDE + DECODE_LATITUDE_RANGE * (gridLatitudeNumber * 1.0 / Math.pow(2, 26));
+  const gridLatitudeMax = DECODE_MIN_LATITUDE + DECODE_LATITUDE_RANGE * ((gridLatitudeNumber + 1) * 1.0 / Math.pow(2, 26));
+  const gridLongitudeMin = DECODE_MIN_LONGITUDE + DECODE_LONGITUDE_RANGE * (gridLongitudeNumber * 1.0 / Math.pow(2, 26));
+  const gridLongitudeMax = DECODE_MIN_LONGITUDE + DECODE_LONGITUDE_RANGE * ((gridLongitudeNumber + 1) * 1.0 / Math.pow(2, 26));
+  
+  // Calculate the center point of the grid cell
+  const latitude = (gridLatitudeMin + gridLatitudeMax) / 2;
+  const longitude = (gridLongitudeMin + gridLongitudeMax) / 2;
   
   return { longitude, latitude };
 }
