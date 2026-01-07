@@ -187,6 +187,178 @@ class BloomFilter {
   }
 }
 
+// Lua Script Executor (Simplified)
+function executeLuaScript(script: string, keys: string[], argv: string[], connection: net.Socket): any {
+  try {
+    // Create a simplified Lua execution context
+    const KEYS = keys;
+    const ARGV = argv;
+    
+    // Helper function to execute Redis commands
+    const redisCall = (...args: string[]): any => {
+      const command = args[0].toLowerCase();
+      const commandArgs = args.slice(1);
+      
+      // Execute the command and return the result
+      if (command === "get") {
+        const key = commandArgs[0];
+        const storedValue = store.get(key);
+        if (storedValue && (!storedValue.expiresAt || storedValue.expiresAt > Date.now())) {
+          return storedValue.value;
+        }
+        return null;
+      } else if (command === "set") {
+        const key = commandArgs[0];
+        const value = commandArgs[1];
+        store.set(key, { value });
+        incrementKeyVersion(key);
+        return "OK";
+      } else if (command === "del") {
+        let count = 0;
+        for (const key of commandArgs) {
+          if (store.delete(key)) count++;
+          if (lists.delete(key)) count++;
+          if (streams.delete(key)) count++;
+          if (sortedSets.delete(key)) count++;
+          if (sets.delete(key)) count++;
+          if (hashes.delete(key)) count++;
+          incrementKeyVersion(key);
+        }
+        return count;
+      } else if (command === "exists") {
+        let count = 0;
+        for (const key of commandArgs) {
+          if (store.has(key) || lists.has(key) || streams.has(key) || 
+              sortedSets.has(key) || sets.has(key) || hashes.has(key)) {
+            count++;
+          }
+        }
+        return count;
+      } else if (command === "incr") {
+        const key = commandArgs[0];
+        const storedValue = store.get(key);
+        const current = storedValue ? parseInt(storedValue.value) : 0;
+        const newValue = current + 1;
+        store.set(key, { value: newValue.toString() });
+        incrementKeyVersion(key);
+        return newValue;
+      } else if (command === "decr") {
+        const key = commandArgs[0];
+        const storedValue = store.get(key);
+        const current = storedValue ? parseInt(storedValue.value) : 0;
+        const newValue = current - 1;
+        store.set(key, { value: newValue.toString() });
+        incrementKeyVersion(key);
+        return newValue;
+      } else if (command === "lpush") {
+        const key = commandArgs[0];
+        const values = commandArgs.slice(1);
+        let list = lists.get(key);
+        if (!list) {
+          list = [];
+          lists.set(key, list);
+        }
+        for (const value of values) {
+          list.unshift(value);
+        }
+        incrementKeyVersion(key);
+        return list.length;
+      } else if (command === "rpush") {
+        const key = commandArgs[0];
+        const values = commandArgs.slice(1);
+        let list = lists.get(key);
+        if (!list) {
+          list = [];
+          lists.set(key, list);
+        }
+        for (const value of values) {
+          list.push(value);
+        }
+        incrementKeyVersion(key);
+        return list.length;
+      } else if (command === "hget") {
+        const key = commandArgs[0];
+        const field = commandArgs[1];
+        const hash = hashes.get(key);
+        return hash?.get(field) || null;
+      } else if (command === "hset") {
+        const key = commandArgs[0];
+        const field = commandArgs[1];
+        const value = commandArgs[2];
+        let hash = hashes.get(key);
+        if (!hash) {
+          hash = new Map();
+          hashes.set(key, hash);
+        }
+        const isNew = !hash.has(field);
+        hash.set(field, value);
+        incrementKeyVersion(key);
+        return isNew ? 1 : 0;
+      } else if (command === "sadd") {
+        const key = commandArgs[0];
+        const members = commandArgs.slice(1);
+        let set = sets.get(key);
+        if (!set) {
+          set = new Set();
+          sets.set(key, set);
+        }
+        let added = 0;
+        for (const member of members) {
+          const sizeBefore = set.size;
+          set.add(member);
+          if (set.size > sizeBefore) added++;
+        }
+        incrementKeyVersion(key);
+        return added;
+      } else if (command === "smembers") {
+        const key = commandArgs[0];
+        const set = sets.get(key);
+        return set ? Array.from(set) : [];
+      } else if (command === "sismember") {
+        const key = commandArgs[0];
+        const member = commandArgs[1];
+        const set = sets.get(key);
+        return set && set.has(member) ? 1 : 0;
+      }
+      
+      // Default: return OK for unknown commands
+      return "OK";
+    };
+    
+    // Simplified Lua execution using JavaScript eval
+    // Replace Lua syntax with JavaScript equivalents
+    let jsCode = script
+      // Replace Lua comments with JS comments
+      .replace(/--/g, '//')
+      // Replace redis.call with our function
+      .replace(/redis\.call/g, 'redisCall')
+      .replace(/redis\.pcall/g, 'redisCall')
+      // Replace Lua array indexing (1-based) with JS (0-based)
+      // This is simplified - real implementation would need proper parsing
+      .replace(/KEYS\[(\d+)\]/g, (_, n) => `KEYS[${parseInt(n) - 1}]`)
+      .replace(/ARGV\[(\d+)\]/g, (_, n) => `ARGV[${parseInt(n) - 1}]`)
+      // Replace Lua return with JS return
+      .replace(/^return\s+/m, 'return ')
+      // Handle Lua string concatenation
+      .replace(/\.\./g, '+');
+    
+    // Execute the script
+    const result = eval(`(function() { 
+      const redis = { call: redisCall, pcall: redisCall };
+      ${jsCode}
+    })()`);
+    
+    return result;
+  } catch (error) {
+    throw new Error(`Script execution error: ${error}`);
+  }
+}
+
+// Helper function to compute SHA1 hash
+function sha1(str: string): string {
+  return crypto.createHash('sha1').update(str).digest('hex');
+}
+
 // Helper function to parse stream entry ID (handles optional sequence number)
 function parseStreamId(id: string, defaultSeq: number): { msTime: number; seqNum: number } {
   const parts = id.split('-');
@@ -368,6 +540,9 @@ const sets = new Map<string, Set<string>>();
 
 // Hashes storage (maps field names to values)
 const hashes = new Map<string, Map<string, string>>();
+
+// Lua script cache (SHA1 -> script)
+const scriptCache = new Map<string, string>();
 
 // Bloom filters storage
 const bloomFilters = new Map<string, BloomFilter>();
@@ -3259,6 +3434,112 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           incrementKeyVersion(key);
           appendToAOF(parsed);
           connection.write(encodeInteger(1));
+        }
+      }
+    } else if (command === "eval") {
+      // EVAL command - execute Lua script
+      // Format: EVAL script numkeys key [key ...] arg [arg ...]
+      if (parsed.length >= 3) {
+        const script = parsed[1];
+        const numkeys = parseInt(parsed[2]);
+        
+        if (isNaN(numkeys) || numkeys < 0) {
+          connection.write("-ERR value is not an integer or out of range\r\n");
+          return;
+        }
+        
+        // Extract KEYS and ARGV
+        const keys = parsed.slice(3, 3 + numkeys);
+        const argv = parsed.slice(3 + numkeys);
+        
+        try {
+          const result = executeLuaScript(script, keys, argv, connection);
+          
+          // Encode result based on type
+          if (result === null || result === undefined) {
+            connection.write(encodeNull(connection));
+          } else if (typeof result === 'number') {
+            connection.write(encodeInteger(result));
+          } else if (typeof result === 'string') {
+            connection.write(encodeBulkString(result));
+          } else if (Array.isArray(result)) {
+            connection.write(encodeArray(result.map(String)));
+          } else {
+            connection.write(encodeBulkString(String(result)));
+          }
+        } catch (error) {
+          connection.write(`-ERR ${error}\r\n`);
+        }
+      }
+    } else if (command === "evalsha") {
+      // EVALSHA command - execute cached script by SHA1
+      // Format: EVALSHA sha1 numkeys key [key ...] arg [arg ...]
+      if (parsed.length >= 3) {
+        const sha = parsed[1];
+        const numkeys = parseInt(parsed[2]);
+        
+        if (isNaN(numkeys) || numkeys < 0) {
+          connection.write("-ERR value is not an integer or out of range\r\n");
+          return;
+        }
+        
+        // Get script from cache
+        const script = scriptCache.get(sha);
+        if (!script) {
+          connection.write("-NOSCRIPT No matching script. Please use EVAL.\r\n");
+          return;
+        }
+        
+        // Extract KEYS and ARGV
+        const keys = parsed.slice(3, 3 + numkeys);
+        const argv = parsed.slice(3 + numkeys);
+        
+        try {
+          const result = executeLuaScript(script, keys, argv, connection);
+          
+          // Encode result based on type
+          if (result === null || result === undefined) {
+            connection.write(encodeNull(connection));
+          } else if (typeof result === 'number') {
+            connection.write(encodeInteger(result));
+          } else if (typeof result === 'string') {
+            connection.write(encodeBulkString(result));
+          } else if (Array.isArray(result)) {
+            connection.write(encodeArray(result.map(String)));
+          } else {
+            connection.write(encodeBulkString(String(result)));
+          }
+        } catch (error) {
+          connection.write(`-ERR ${error}\r\n`);
+        }
+      }
+    } else if (command === "script") {
+      // SCRIPT command with subcommands
+      if (parsed.length >= 2) {
+        const subcommand = parsed[1].toLowerCase();
+        
+        if (subcommand === "load") {
+          // SCRIPT LOAD - load script into cache
+          if (parsed.length >= 3) {
+            const script = parsed[2];
+            const sha = sha1(script);
+            scriptCache.set(sha, script);
+            connection.write(encodeBulkString(sha));
+          }
+        } else if (subcommand === "exists") {
+          // SCRIPT EXISTS - check if scripts exist
+          const shas = parsed.slice(2);
+          let response = `*${shas.length}\r\n`;
+          for (const sha of shas) {
+            response += encodeInteger(scriptCache.has(sha) ? 1 : 0);
+          }
+          connection.write(response);
+        } else if (subcommand === "flush") {
+          // SCRIPT FLUSH - clear script cache
+          scriptCache.clear();
+          connection.write("+OK\r\n");
+        } else {
+          connection.write("-ERR unknown SCRIPT subcommand\r\n");
         }
       }
     } else if (command === "rpush") {
