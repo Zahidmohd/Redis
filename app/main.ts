@@ -73,6 +73,94 @@ function compareStreamIds(id1: { msTime: number; seqNum: number }, id2: { msTime
   return id1.seqNum - id2.seqNum;
 }
 
+// Helper function to encode geohash from longitude and latitude
+function encodeGeohash(longitude: number, latitude: number): number {
+  // Longitude range: -180 to +180
+  const lonMin = -180.0;
+  const lonMax = 180.0;
+  
+  // Latitude range: -85.05112878 to +85.05112878 (Web Mercator limits)
+  const latMin = -85.05112878;
+  const latMax = 85.05112878;
+  
+  // Normalize longitude to [0, 1]
+  const lonNormalized = (longitude - lonMin) / (lonMax - lonMin);
+  
+  // Normalize latitude to [0, 1]
+  const latNormalized = (latitude - latMin) / (latMax - latMin);
+  
+  // Convert normalized values to 26-bit integers (for 52-bit total precision)
+  const lonBits = Math.floor(lonNormalized * 0x3FFFFFF); // 2^26 - 1 = 67108863
+  const latBits = Math.floor(latNormalized * 0x3FFFFFF);
+  
+  // Interleave the bits: longitude bits at even positions, latitude bits at odd positions
+  let geohash = 0;
+  for (let i = 0; i < 26; i++) {
+    // Extract bit i from longitude and place at position 2*i
+    geohash |= ((lonBits >> i) & 1) << (2 * i);
+    
+    // Extract bit i from latitude and place at position 2*i + 1
+    geohash |= ((latBits >> i) & 1) << (2 * i + 1);
+  }
+  
+  return geohash;
+}
+
+// Helper function to decode geohash back to longitude and latitude
+function decodeGeohash(geohash: number): { longitude: number, latitude: number } {
+  // De-interleave the bits to extract longitude and latitude
+  let lonBits = 0;
+  let latBits = 0;
+  
+  for (let i = 0; i < 26; i++) {
+    // Extract longitude bit from even position (2*i)
+    lonBits |= ((geohash >> (2 * i)) & 1) << i;
+    
+    // Extract latitude bit from odd position (2*i + 1)
+    latBits |= ((geohash >> (2 * i + 1)) & 1) << i;
+  }
+  
+  // Convert from 26-bit integers back to normalized [0, 1]
+  const lonNormalized = lonBits / 0x3FFFFFF;
+  const latNormalized = latBits / 0x3FFFFFF;
+  
+  // Denormalize to original ranges
+  const lonMin = -180.0;
+  const lonMax = 180.0;
+  const latMin = -85.05112878;
+  const latMax = 85.05112878;
+  
+  const longitude = lonMin + (lonNormalized * (lonMax - lonMin));
+  const latitude = latMin + (latNormalized * (latMax - latMin));
+  
+  return { longitude, latitude };
+}
+
+// Helper function to calculate distance between two coordinates using Haversine formula
+function calculateDistance(lon1: number, lat1: number, lon2: number, lat2: number): number {
+  // Earth's radius in meters (as used by Redis)
+  const EARTH_RADIUS = 6372797.560856;
+  
+  // Convert degrees to radians
+  const toRadians = (degrees: number) => degrees * Math.PI / 180;
+  
+  const φ1 = toRadians(lat1);
+  const φ2 = toRadians(lat2);
+  const Δφ = toRadians(lat2 - lat1);
+  const Δλ = toRadians(lon2 - lon1);
+  
+  // Haversine formula
+  const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+            Math.cos(φ1) * Math.cos(φ2) *
+            Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+  
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  
+  const distance = EARTH_RADIUS * c;
+  
+  return distance;
+}
+
 // In-memory storage for key-value pairs with expiry
 interface StoredValue {
   value: string;
@@ -1140,6 +1228,158 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           // Return 1 (number of members removed)
           connection.write(encodeInteger(1));
         }
+      }
+    } else if (command === "geoadd") {
+      // GEOADD command - add a geospatial location
+      // Format: GEOADD key longitude latitude member
+      if (parsed.length >= 5) {
+        const key = parsed[1];
+        const longitude = parseFloat(parsed[2]);
+        const latitude = parseFloat(parsed[3]);
+        const member = parsed[4];
+        
+        // Validate longitude: -180 to +180 (inclusive)
+        if (longitude < -180 || longitude > 180) {
+          connection.write(`-ERR invalid longitude,latitude pair ${longitude},${latitude}\r\n`);
+          return;
+        }
+        
+        // Validate latitude: -85.05112878 to +85.05112878 (inclusive)
+        if (latitude < -85.05112878 || latitude > 85.05112878) {
+          connection.write(`-ERR invalid longitude,latitude pair ${longitude},${latitude}\r\n`);
+          return;
+        }
+        
+        // Store location in sorted set
+        // Calculate geohash score from longitude and latitude
+        const score = encodeGeohash(longitude, latitude);
+        
+        // Get or create sorted set
+        let sortedSet = sortedSets.get(key);
+        if (!sortedSet) {
+          sortedSet = [];
+          sortedSets.set(key, sortedSet);
+        }
+        
+        // Check if member already exists
+        const existingIndex = sortedSet.findIndex(m => m.member === member);
+        let newMembersAdded = 0;
+        
+        if (existingIndex === -1) {
+          // New member - add it in sorted position
+          newMembersAdded = 1;
+          
+          // Find the correct position to insert (maintain sorted order by score, then lexicographically)
+          let insertIndex = 0;
+          for (let i = 0; i < sortedSet.length; i++) {
+            if (sortedSet[i].score > score) {
+              break;
+            } else if (sortedSet[i].score === score && sortedSet[i].member > member) {
+              break;
+            }
+            insertIndex = i + 1;
+          }
+          
+          // Insert at the correct position
+          sortedSet.splice(insertIndex, 0, { member, score });
+        } else {
+          // Member exists - update score if different
+          if (sortedSet[existingIndex].score !== score) {
+            // Remove old entry
+            sortedSet.splice(existingIndex, 1);
+            
+            // Find new position and insert
+            let insertIndex = 0;
+            for (let i = 0; i < sortedSet.length; i++) {
+              if (sortedSet[i].score > score) {
+                break;
+              } else if (sortedSet[i].score === score && sortedSet[i].member > member) {
+                break;
+              }
+              insertIndex = i + 1;
+            }
+            sortedSet.splice(insertIndex, 0, { member, score });
+          }
+          // newMembersAdded remains 0 since member already existed
+        }
+        
+        // Return the number of new members added
+        connection.write(encodeInteger(newMembersAdded));
+      }
+    } else if (command === "geopos") {
+      // GEOPOS command - get the longitude and latitude of locations
+      // Format: GEOPOS key member [member ...]
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const members = parsed.slice(2); // Get all member names
+        
+        // Get the sorted set
+        const sortedSet = sortedSets.get(key);
+        
+        // Build response array - one entry per requested member
+        let response = `*${members.length}\r\n`;
+        
+        for (const member of members) {
+          // Find the member in the sorted set
+          const foundMember = sortedSet ? sortedSet.find(m => m.member === member) : undefined;
+          
+          if (foundMember) {
+            // Member exists - decode geohash to get longitude and latitude
+            const { longitude, latitude } = decodeGeohash(foundMember.score);
+            
+            // Return [longitude, latitude] as bulk strings
+            response += "*2\r\n";
+            response += encodeBulkString(longitude.toString());
+            response += encodeBulkString(latitude.toString());
+          } else {
+            // Member or key doesn't exist - return null array
+            response += "*-1\r\n";
+          }
+        }
+        
+        connection.write(response);
+      }
+    } else if (command === "geodist") {
+      // GEODIST command - calculate distance between two locations
+      // Format: GEODIST key member1 member2 [unit]
+      if (parsed.length >= 4) {
+        const key = parsed[1];
+        const member1 = parsed[2];
+        const member2 = parsed[3];
+        // Unit is optional (m, km, ft, mi), default is meters
+        // For now we'll just handle meters
+        
+        // Get the sorted set
+        const sortedSet = sortedSets.get(key);
+        
+        if (!sortedSet) {
+          // Key doesn't exist - return null
+          connection.write("$-1\r\n");
+          return;
+        }
+        
+        // Find both members
+        const foundMember1 = sortedSet.find(m => m.member === member1);
+        const foundMember2 = sortedSet.find(m => m.member === member2);
+        
+        if (!foundMember1 || !foundMember2) {
+          // One or both members don't exist - return null
+          connection.write("$-1\r\n");
+          return;
+        }
+        
+        // Decode geohashes to get coordinates
+        const coords1 = decodeGeohash(foundMember1.score);
+        const coords2 = decodeGeohash(foundMember2.score);
+        
+        // Calculate distance using Haversine formula
+        const distance = calculateDistance(
+          coords1.longitude, coords1.latitude,
+          coords2.longitude, coords2.latitude
+        );
+        
+        // Return distance as bulk string
+        connection.write(encodeBulkString(distance.toString()));
       }
     } else if (command === "set") {
       // SET requires two arguments: key and value
