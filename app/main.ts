@@ -245,6 +245,76 @@ function wakeUpBlockedClients(key: string): void {
   }
 }
 
+// Helper function to execute a command and return the response
+function executeCommand(parsed: string[]): string {
+  const command = parsed[0].toLowerCase();
+  
+  if (command === "set") {
+    if (parsed.length >= 3) {
+      const key = parsed[1];
+      const value = parsed[2];
+      let expiresAt: number | undefined = undefined;
+      
+      for (let i = 3; i < parsed.length; i += 2) {
+        const option = parsed[i].toLowerCase();
+        if (option === "px") {
+          const milliseconds = parseInt(parsed[i + 1]);
+          expiresAt = Date.now() + milliseconds;
+        } else if (option === "ex") {
+          const seconds = parseInt(parsed[i + 1]);
+          expiresAt = Date.now() + (seconds * 1000);
+        }
+      }
+      
+      store.set(key, { value, expiresAt });
+      return "+OK\r\n";
+    }
+  } else if (command === "get") {
+    if (parsed.length >= 2) {
+      const key = parsed[1];
+      const storedValue = store.get(key);
+      
+      if (storedValue) {
+        if (storedValue.expiresAt && Date.now() > storedValue.expiresAt) {
+          store.delete(key);
+          return encodeBulkString(null);
+        } else {
+          return encodeBulkString(storedValue.value);
+        }
+      } else {
+        return encodeBulkString(null);
+      }
+    }
+  } else if (command === "incr") {
+    if (parsed.length >= 2) {
+      const key = parsed[1];
+      const storedValue = store.get(key);
+      
+      if (storedValue) {
+        const trimmedValue = storedValue.value.trim();
+        const currentValue = parseInt(trimmedValue);
+        
+        if (isNaN(currentValue) || !/^-?\d+$/.test(trimmedValue)) {
+          return "-ERR value is not an integer or out of range\r\n";
+        }
+        
+        const newValue = currentValue + 1;
+        store.set(key, {
+          value: newValue.toString(),
+          expiresAt: storedValue.expiresAt
+        });
+        
+        return encodeInteger(newValue);
+      } else {
+        store.set(key, { value: "1" });
+        return encodeInteger(1);
+      }
+    }
+  }
+  
+  return "+OK\r\n";
+}
+
 const server: net.Server = net.createServer((connection: net.Socket) => {
   // Handle connection
   connection.on("data", (data: Buffer) => {
@@ -276,6 +346,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
     } else if (command === "multi") {
       // Start a transaction
       transactionState.set(connection, true);
+      queuedCommands.set(connection, []);
       connection.write("+OK\r\n");
     } else if (command === "exec") {
       // Check if MULTI was called
@@ -283,11 +354,27 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       if (!inTransaction) {
         connection.write("-ERR EXEC without MULTI\r\n");
       } else {
-        // Execute the transaction (empty for now)
-        // Clear the transaction state
+        // Get queued commands
+        const queue = queuedCommands.get(connection) || [];
+        
+        // Clear the transaction state and queue
         transactionState.delete(connection);
-        // Return empty array
-        connection.write("*0\r\n");
+        queuedCommands.delete(connection);
+        
+        // Execute all queued commands and collect responses
+        const responses: string[] = [];
+        for (const queuedCmd of queue) {
+          const response = executeCommand(queuedCmd);
+          responses.push(response);
+        }
+        
+        // Build the array response
+        let arrayResponse = `*${responses.length}\r\n`;
+        for (const response of responses) {
+          arrayResponse += response;
+        }
+        
+        connection.write(arrayResponse);
       }
     } else if (command === "echo") {
       // ECHO requires one argument
@@ -1022,6 +1109,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
   // Clean up transaction state when connection closes
   connection.on("close", () => {
     transactionState.delete(connection);
+    queuedCommands.delete(connection);
   });
 });
 
