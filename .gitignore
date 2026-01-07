@@ -1,6 +1,5 @@
 node_modules/
 package-lock.json
-bun.lockb
 project_plan.md
 OPTIMISTIC_LOCKING.md
 IMPLEMENTATION_NOTES.md
