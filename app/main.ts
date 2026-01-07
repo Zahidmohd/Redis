@@ -135,6 +135,10 @@ for (let i = 0; i < cmdArgs.length; i++) {
   }
 }
 
+// Replication ID and offset (for master servers)
+const masterReplId = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+const masterReplOffset = 0;
+
 // Helper function to wake up blocked XREAD clients when entries are added to a stream
 function wakeUpBlockedXReadClients(streamKey: string): void {
   // Check all blocked XREAD clients
@@ -371,7 +375,14 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       
       // For now, we only handle the replication section
       if (section === "" || section === "replication") {
-        const response = `role:${serverRole}`;
+        let response = `role:${serverRole}`;
+        
+        // Add master-specific fields if this is a master server
+        if (serverRole === "master") {
+          response += `\nmaster_replid:${masterReplId}`;
+          response += `\nmaster_repl_offset:${masterReplOffset}`;
+        }
+        
         connection.write(encodeBulkString(response));
       } else {
         // Other sections not implemented yet
@@ -1160,3 +1171,57 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
 
 server.listen(serverPort, "127.0.0.1");
 console.log(`Redis server listening on port ${serverPort} as ${serverRole}`);
+
+// If this is a replica, initiate handshake with master
+if (serverRole === "slave" && masterHost && masterPort) {
+  console.log(`Connecting to master at ${masterHost}:${masterPort}`);
+  
+  let handshakeStep = 0; // Track handshake progress
+  
+  const masterConnection = net.createConnection({
+    host: masterHost,
+    port: masterPort
+  }, () => {
+    console.log("Connected to master, sending PING");
+    
+    // Step 1: Send PING command as RESP array
+    // *1\r\n$4\r\nPING\r\n
+    masterConnection.write("*1\r\n$4\r\nPING\r\n");
+    handshakeStep = 1;
+  });
+  
+  masterConnection.on("error", (err: Error) => {
+    console.error("Master connection error:", err);
+  });
+  
+  masterConnection.on("data", (data: Buffer) => {
+    console.log("Received from master:", data.toString());
+    
+    // Handle handshake responses
+    if (handshakeStep === 1) {
+      // Received PONG, send REPLCONF listening-port
+      console.log("Received PONG, sending REPLCONF listening-port");
+      
+      // REPLCONF listening-port <PORT>
+      // *3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$<length>\r\n<PORT>\r\n
+      const portStr = serverPort.toString();
+      const replconfPort = `*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$${portStr.length}\r\n${portStr}\r\n`;
+      masterConnection.write(replconfPort);
+      handshakeStep = 2;
+      
+    } else if (handshakeStep === 2) {
+      // Received OK for listening-port, send REPLCONF capa psync2
+      console.log("Received OK, sending REPLCONF capa psync2");
+      
+      // REPLCONF capa psync2
+      // *3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n
+      masterConnection.write("*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n");
+      handshakeStep = 3;
+      
+    } else if (handshakeStep === 3) {
+      // Received OK for capa psync2, handshake complete
+      console.log("Received OK, handshake step 2 complete");
+      handshakeStep = 4;
+    }
+  });
+}
