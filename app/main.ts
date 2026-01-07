@@ -254,6 +254,8 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
     
     if (command === "ping") {
       connection.write("+PONG\r\n");
+    } else if (command === "multi") {
+      connection.write("+OK\r\n");
     } else if (command === "echo") {
       // ECHO requires one argument
       if (parsed.length >= 2) {
