@@ -769,6 +769,20 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       const streamKeys = argsAfterStreams.slice(0, numStreams);
       const afterIds = argsAfterStreams.slice(numStreams);
       
+      // Handle $ as special ID - replace with last entry ID in stream
+      for (let i = 0; i < afterIds.length; i++) {
+        if (afterIds[i] === '$') {
+          const stream = streams.get(streamKeys[i]);
+          if (stream && stream.length > 0) {
+            // Use the last entry's ID
+            afterIds[i] = stream[stream.length - 1].id;
+          } else {
+            // Stream is empty or doesn't exist, use "0-0"
+            afterIds[i] = "0-0";
+          }
+        }
+      }
+      
       // Collect results for all streams
       const streamResults: Array<{ key: string; entries: StreamEntry[] }> = [];
       
