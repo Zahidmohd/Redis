@@ -1219,9 +1219,18 @@ if (serverRole === "slave" && masterHost && masterPort) {
       handshakeStep = 3;
       
     } else if (handshakeStep === 3) {
-      // Received OK for capa psync2, handshake complete
-      console.log("Received OK, handshake step 2 complete");
+      // Received OK for capa psync2, send PSYNC
+      console.log("Received OK, sending PSYNC ? -1");
+      
+      // PSYNC ? -1
+      // *3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n
+      masterConnection.write("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n");
       handshakeStep = 4;
+      
+    } else if (handshakeStep === 4) {
+      // Received FULLRESYNC, handshake complete
+      console.log("Received FULLRESYNC, handshake complete");
+      handshakeStep = 5;
     }
   });
 }
