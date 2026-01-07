@@ -46,6 +46,15 @@ function encodeInteger(num: number): string {
   return `:${num}\r\n`;
 }
 
+// Encode an array as a RESP array
+function encodeArray(items: string[]): string {
+  let result = `*${items.length}\r\n`;
+  for (const item of items) {
+    result += encodeBulkString(item);
+  }
+  return result;
+}
+
 // In-memory storage for key-value pairs with expiry
 interface StoredValue {
   value: string;
@@ -144,6 +153,43 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         
         // Return the length of the list as a RESP integer
         connection.write(encodeInteger(list.length));
+      }
+    } else if (command === "lrange") {
+      // LRANGE requires three arguments: key, start, stop
+      if (parsed.length >= 4) {
+        const key = parsed[1];
+        const start = parseInt(parsed[2]);
+        const stop = parseInt(parsed[3]);
+        
+        // Get the list
+        const list = lists.get(key);
+        
+        // If list doesn't exist, return empty array
+        if (!list) {
+          connection.write("*0\r\n");
+          return;
+        }
+        
+        // If start >= list length, return empty array
+        if (start >= list.length) {
+          connection.write("*0\r\n");
+          return;
+        }
+        
+        // If start > stop, return empty array
+        if (start > stop) {
+          connection.write("*0\r\n");
+          return;
+        }
+        
+        // Calculate actual stop index (inclusive, but limited to list length)
+        const actualStop = Math.min(stop, list.length - 1);
+        
+        // Extract the range (stop is inclusive, so we need actualStop + 1 for slice)
+        const range = list.slice(start, actualStop + 1);
+        
+        // Return the range as a RESP array
+        connection.write(encodeArray(range));
       }
     }
   });
