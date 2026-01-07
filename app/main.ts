@@ -71,6 +71,7 @@ interface BlockedClient {
   socket: net.Socket;
   key: string;
   timestamp: number;
+  timeoutId?: NodeJS.Timeout;  // Timer for non-zero timeouts
 }
 const blockedClients = new Map<string, BlockedClient[]>();
 
@@ -90,6 +91,11 @@ function wakeUpBlockedClients(key: string): void {
   while (blocked.length > 0 && list.length > 0) {
     const client = blocked.shift()!;
     const element = list.shift()!;
+    
+    // Clear timeout if it exists
+    if (client.timeoutId) {
+      clearTimeout(client.timeoutId);
+    }
     
     // Send response: [key, element]
     const response = encodeArray([key, element]);
@@ -291,7 +297,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       // BLPOP requires two arguments: key and timeout
       if (parsed.length >= 3) {
         const key = parsed[1];
-        const timeout = parseInt(parsed[2]); // For now, we only handle timeout = 0 (indefinite)
+        const timeoutSeconds = parseFloat(parsed[2]); // Can be decimal (0.5 = 500ms)
         
         const list = lists.get(key);
         
@@ -314,14 +320,42 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
             blockedClients.set(key, blocked);
           }
           
-          // Add client to blocked queue with timestamp for FIFO ordering
-          blocked.push({
+          // Create blocked client entry
+          const blockedClient: BlockedClient = {
             socket: connection,
             key: key,
             timestamp: Date.now()
-          });
+          };
           
-          // Don't send response yet - will be sent when element is added
+          // Set up timeout if non-zero
+          if (timeoutSeconds > 0) {
+            const timeoutMs = timeoutSeconds * 1000;
+            const timeoutId = setTimeout(() => {
+              // Find and remove this client from blocked queue
+              const blocked = blockedClients.get(key);
+              if (blocked) {
+                const index = blocked.indexOf(blockedClient);
+                if (index !== -1) {
+                  blocked.splice(index, 1);
+                  
+                  // Clean up empty blocked clients array
+                  if (blocked.length === 0) {
+                    blockedClients.delete(key);
+                  }
+                }
+              }
+              
+              // Send null array response
+              connection.write("*-1\r\n");
+            }, timeoutMs);
+            
+            blockedClient.timeoutId = timeoutId;
+          }
+          
+          // Add client to blocked queue
+          blocked.push(blockedClient);
+          
+          // Don't send response yet - will be sent when element is added or timeout expires
         }
       }
     } else if (command === "lrange") {
