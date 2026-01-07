@@ -90,8 +90,9 @@ function encodeGeohash(longitude: number, latitude: number): number {
   const latNormalized = (latitude - latMin) / (latMax - latMin);
   
   // Convert normalized values to 26-bit integers (for 52-bit total precision)
-  const lonBits = Math.floor(lonNormalized * 0x3FFFFFF); // 2^26 - 1 = 67108863
-  const latBits = Math.floor(latNormalized * 0x3FFFFFF);
+  // Use 2^26 (not 2^26 - 1) and clamp to ensure we stay within 26 bits
+  const lonBits = Math.min(Math.floor(lonNormalized * 0x4000000), 0x3FFFFFF); // 2^26 = 67108864
+  const latBits = Math.min(Math.floor(latNormalized * 0x4000000), 0x3FFFFFF);
   
   // Interleave the bits: longitude bits at even positions, latitude bits at odd positions
   // Use arithmetic instead of bitwise operations to handle 52-bit numbers
@@ -137,8 +138,9 @@ function decodeGeohash(geohash: number): { longitude: number, latitude: number }
   }
   
   // Convert from 26-bit integers back to normalized [0, 1]
-  const lonNormalized = lonBits / 0x3FFFFFF;
-  const latNormalized = latBits / 0x3FFFFFF;
+  // Use 2^26 (not 2^26 - 1) to match the encoding
+  const lonNormalized = lonBits / 0x4000000;
+  const latNormalized = latBits / 0x4000000;
   
   // Denormalize to original ranges
   const lonMin = -180.0;
