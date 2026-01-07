@@ -137,13 +137,16 @@ for (let i = 0; i < cmdArgs.length; i++) {
 
 // Replication ID and offset (for master servers)
 const masterReplId = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
-const masterReplOffset = 0;
+let masterReplOffset = 0; // Changed to let so we can update it
 
 // Track connected replicas
 const replicas: net.Socket[] = [];
 
+// Track each replica's acknowledged offset
+const replicaOffsets = new Map<net.Socket, number>();
+
 // Helper function to propagate commands to all replicas
-function propagateToReplicas(commandArray: string[]): void {
+function propagateToReplicas(commandArray: string[]): number {
   // Build RESP array for the command
   let resp = `*${commandArray.length}\r\n`;
   for (const arg of commandArray) {
@@ -154,6 +157,12 @@ function propagateToReplicas(commandArray: string[]): void {
   for (const replica of replicas) {
     replica.write(resp);
   }
+  
+  // Update master offset and return byte count
+  const byteCount = resp.length;
+  masterReplOffset += byteCount;
+  
+  return byteCount;
 }
 
 // Helper function to wake up blocked XREAD clients when entries are added to a stream
@@ -427,6 +436,25 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       // Note: No trailing \r\n after contents
       connection.write(`$${rdbBuffer.length}\r\n`);
       connection.write(rdbBuffer);
+      
+      // Add this connection to the list of replicas
+      replicas.push(connection);
+      replicaOffsets.set(connection, 0); // Initialize replica offset to 0
+      console.log(`Replica connected, total replicas: ${replicas.length}`);
+      
+      // Set up a data listener for this replica to handle REPLCONF ACK responses
+      connection.on("data", (data: Buffer) => {
+        const parsed = parseRESP(data);
+        if (parsed && parsed.length >= 3) {
+          const cmd = parsed[0].toLowerCase();
+          if (cmd === "replconf" && parsed[1].toLowerCase() === "ack") {
+            // Update the replica's offset
+            const offset = parseInt(parsed[2]);
+            replicaOffsets.set(connection, offset);
+            console.log(`Replica ACK received: offset ${offset}`);
+          }
+        }
+      });
     } else if (command === "multi") {
       // Start a transaction
       transactionState.set(connection, true);
@@ -471,6 +499,55 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         queuedCommands.delete(connection);
         connection.write("+OK\r\n");
       }
+    } else if (command === "wait") {
+      // WAIT <numreplicas> <timeout>
+      if (parsed.length >= 3) {
+        const numreplicas = parseInt(parsed[1]);
+        const timeout = parseInt(parsed[2]);
+        
+        // If no write commands have been sent, all replicas are in sync
+        if (masterReplOffset === 0) {
+          connection.write(encodeInteger(replicas.length));
+          return;
+        }
+        
+        // Send REPLCONF GETACK * to all replicas
+        const getackCommand = "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n";
+        for (const replica of replicas) {
+          replica.write(getackCommand);
+        }
+        
+        // Function to count replicas that have acknowledged all commands
+        const countAckedReplicas = (): number => {
+          let count = 0;
+          for (const replica of replicas) {
+            const replicaOffset = replicaOffsets.get(replica) || 0;
+            if (replicaOffset >= masterReplOffset) {
+              count++;
+            }
+          }
+          return count;
+        };
+        
+        // Set up polling to check for acknowledgements
+        const startTime = Date.now();
+        const checkInterval = 10; // Check every 10ms
+        
+        const checkAcks = () => {
+          const ackedCount = countAckedReplicas();
+          
+          // Check if we've met the requirement or timed out
+          if (ackedCount >= numreplicas || Date.now() - startTime >= timeout) {
+            connection.write(encodeInteger(ackedCount));
+          } else {
+            // Continue polling
+            setTimeout(checkAcks, checkInterval);
+          }
+        };
+        
+        // Start checking
+        setTimeout(checkAcks, checkInterval);
+      }
     } else if (command === "echo") {
       // ECHO requires one argument
       if (parsed.length >= 2) {
@@ -504,6 +581,11 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         
         store.set(key, { value, expiresAt });
         connection.write("+OK\r\n");
+        
+        // Propagate write command to replicas
+        if (serverRole === "master") {
+          propagateToReplicas(parsed);
+        }
       }
     } else if (command === "get") {
       // GET requires one argument: key
@@ -1205,6 +1287,13 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
   connection.on("close", () => {
     transactionState.delete(connection);
     queuedCommands.delete(connection);
+    
+    // Remove from replicas list if this was a replica connection
+    const replicaIndex = replicas.indexOf(connection);
+    if (replicaIndex !== -1) {
+      replicas.splice(replicaIndex, 1);
+      console.log(`Replica disconnected, total replicas: ${replicas.length}`);
+    }
   });
 });
 
@@ -1216,6 +1305,9 @@ if (serverRole === "slave" && masterHost && masterPort) {
   console.log(`Connecting to master at ${masterHost}:${masterPort}`);
   
   let handshakeStep = 0; // Track handshake progress
+  let rdbReceived = false; // Track if RDB file has been fully received
+  let dataBuffer = Buffer.alloc(0); // Buffer for accumulating data
+  let replicaOffset = 0; // Track number of bytes processed
   
   const masterConnection = net.createConnection({
     host: masterHost,
@@ -1234,42 +1326,138 @@ if (serverRole === "slave" && masterHost && masterPort) {
   });
   
   masterConnection.on("data", (data: Buffer) => {
-    console.log("Received from master:", data.toString());
+    dataBuffer = Buffer.concat([dataBuffer, data]);
     
     // Handle handshake responses
     if (handshakeStep === 1) {
       // Received PONG, send REPLCONF listening-port
       console.log("Received PONG, sending REPLCONF listening-port");
       
-      // REPLCONF listening-port <PORT>
-      // *3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$<length>\r\n<PORT>\r\n
       const portStr = serverPort.toString();
       const replconfPort = `*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$${portStr.length}\r\n${portStr}\r\n`;
       masterConnection.write(replconfPort);
       handshakeStep = 2;
+      dataBuffer = Buffer.alloc(0);
       
     } else if (handshakeStep === 2) {
       // Received OK for listening-port, send REPLCONF capa psync2
       console.log("Received OK, sending REPLCONF capa psync2");
       
-      // REPLCONF capa psync2
-      // *3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n
       masterConnection.write("*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n");
       handshakeStep = 3;
+      dataBuffer = Buffer.alloc(0);
       
     } else if (handshakeStep === 3) {
       // Received OK for capa psync2, send PSYNC
       console.log("Received OK, sending PSYNC ? -1");
       
-      // PSYNC ? -1
-      // *3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n
       masterConnection.write("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n");
       handshakeStep = 4;
+      dataBuffer = Buffer.alloc(0);
       
-    } else if (handshakeStep === 4) {
-      // Received FULLRESYNC, handshake complete
-      console.log("Received FULLRESYNC, handshake complete");
-      handshakeStep = 5;
+    } else if (handshakeStep === 4 && !rdbReceived) {
+      // Received FULLRESYNC and RDB file
+      const bufferStr = dataBuffer.toString();
+      
+      // Check if we have the FULLRESYNC response
+      if (bufferStr.includes("FULLRESYNC")) {
+        console.log("Received FULLRESYNC");
+        
+        // Find the RDB file marker ($<length>\r\n)
+        const rdbMarkerIndex = bufferStr.indexOf("\n$");
+        if (rdbMarkerIndex !== -1) {
+          // Parse RDB length
+          const rdbStart = rdbMarkerIndex + 2; // Skip \n$
+          const rdbLengthEnd = bufferStr.indexOf("\r\n", rdbStart);
+          
+          if (rdbLengthEnd !== -1) {
+            const rdbLength = parseInt(bufferStr.substring(rdbStart, rdbLengthEnd));
+            const rdbContentStart = rdbLengthEnd + 2; // Skip \r\n
+            
+            // Check if we have the full RDB file
+            if (dataBuffer.length >= rdbContentStart + rdbLength) {
+              console.log(`RDB file received (${rdbLength} bytes)`);
+              rdbReceived = true;
+              handshakeStep = 5;
+              
+              // Remove everything up to and including the RDB file
+              dataBuffer = dataBuffer.slice(rdbContentStart + rdbLength);
+            }
+          }
+        }
+      }
+      
+    } else if (handshakeStep === 5 && rdbReceived) {
+      // Process propagated commands
+      while (dataBuffer.length > 0) {
+        const parsed = parseRESP(dataBuffer);
+        
+        if (!parsed || parsed.length === 0) {
+          // Not enough data for a complete command, wait for more
+          break;
+        }
+        
+        // Process the command
+        const command = parsed[0].toLowerCase();
+        console.log(`Processing propagated command: ${command}`);
+        
+        // Handle REPLCONF GETACK - this is the only command that requires a response
+        if (command === "replconf" && parsed.length >= 2 && parsed[1].toLowerCase() === "getack") {
+          console.log(`Received REPLCONF GETACK, responding with ACK ${replicaOffset}`);
+          // Respond with REPLCONF ACK <offset> as RESP array
+          const offsetStr = replicaOffset.toString();
+          const response = `*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$${offsetStr.length}\r\n${offsetStr}\r\n`;
+          masterConnection.write(response);
+        } else if (command === "set") {
+          if (parsed.length >= 3) {
+            const key = parsed[1];
+            const value = parsed[2];
+            
+            let expiresAt: number | undefined = undefined;
+            for (let i = 3; i < parsed.length; i += 2) {
+              const option = parsed[i]?.toLowerCase();
+              const optionValue = parsed[i + 1];
+              
+              if (option === "px" && optionValue) {
+                const milliseconds = parseInt(optionValue);
+                expiresAt = Date.now() + milliseconds;
+              } else if (option === "ex" && optionValue) {
+                const seconds = parseInt(optionValue);
+                expiresAt = Date.now() + (seconds * 1000);
+              }
+            }
+            
+            store.set(key, { value, expiresAt });
+            console.log(`SET ${key} = ${value}`);
+          }
+        }
+        
+        // Remove the processed command from buffer
+        // We need to calculate how many bytes were consumed
+        const bufferStr = dataBuffer.toString();
+        const firstArrayEnd = bufferStr.indexOf("\r\n");
+        if (firstArrayEnd === -1) break;
+        
+        const numElements = parseInt(bufferStr.substring(1, firstArrayEnd));
+        let consumed = firstArrayEnd + 2;
+        
+        for (let i = 0; i < numElements; i++) {
+          // Find bulk string length
+          const bulkStart = bufferStr.indexOf("$", consumed);
+          if (bulkStart === -1) break;
+          const bulkLengthEnd = bufferStr.indexOf("\r\n", bulkStart);
+          if (bulkLengthEnd === -1) break;
+          
+          const bulkLength = parseInt(bufferStr.substring(bulkStart + 1, bulkLengthEnd));
+          consumed = bulkLengthEnd + 2 + bulkLength + 2; // +2 for \r\n after content
+        }
+        
+        // Update replica offset with the bytes consumed
+        replicaOffset += consumed;
+        console.log(`Updated replica offset: ${replicaOffset} (consumed ${consumed} bytes)`);
+        
+        dataBuffer = dataBuffer.slice(consumed);
+      }
     }
   });
 }
