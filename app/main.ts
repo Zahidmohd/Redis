@@ -192,17 +192,41 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       }
     } else if (command === "lpop") {
       // LPOP requires one argument: key
+      // Optional second argument: count (number of elements to remove)
       if (parsed.length >= 2) {
         const key = parsed[1];
         const list = lists.get(key);
         
+        // Check if count argument is provided
+        const count = parsed.length >= 3 ? parseInt(parsed[2]) : 1;
+        
         // If list doesn't exist or is empty, return null bulk string
         if (!list || list.length === 0) {
           connection.write(encodeBulkString(null));
-        } else {
-          // Remove and return the first element
+        } else if (count === 1) {
+          // Single element: return as bulk string (backward compatibility)
           const element = list.shift();
           connection.write(encodeBulkString(element!));
+          
+          // Clean up empty list
+          if (list.length === 0) {
+            lists.delete(key);
+          }
+        } else {
+          // Multiple elements: return as array
+          const numToRemove = Math.min(count, list.length);
+          const removed: string[] = [];
+          
+          // Remove elements from the start
+          for (let i = 0; i < numToRemove; i++) {
+            const element = list.shift();
+            if (element !== undefined) {
+              removed.push(element);
+            }
+          }
+          
+          // Return as RESP array
+          connection.write(encodeArray(removed));
           
           // Clean up empty list
           if (list.length === 0) {
