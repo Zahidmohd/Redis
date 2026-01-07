@@ -315,15 +315,12 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         const key = parsed[1];
         const storedValue = store.get(key);
         
-        // For this stage, we only handle existing keys with numerical values
         if (storedValue) {
-          // Parse the current value as integer
+          // Key exists - parse current value as integer and increment
           const currentValue = parseInt(storedValue.value);
-          
-          // Increment by 1
           const newValue = currentValue + 1;
           
-          // Store the new value
+          // Store the new value (preserve expiry if it exists)
           store.set(key, {
             value: newValue.toString(),
             expiresAt: storedValue.expiresAt
@@ -331,6 +328,14 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           
           // Return the new value as RESP integer
           connection.write(encodeInteger(newValue));
+        } else {
+          // Key doesn't exist - set to 1
+          store.set(key, {
+            value: "1"
+          });
+          
+          // Return 1 as RESP integer
+          connection.write(encodeInteger(1));
         }
       }
     } else if (command === "rpush") {
