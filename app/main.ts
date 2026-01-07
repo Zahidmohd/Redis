@@ -1381,6 +1381,74 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         // Return distance as bulk string
         connection.write(encodeBulkString(distance.toString()));
       }
+    } else if (command === "geosearch") {
+      // GEOSEARCH command - search for locations within a radius
+      // Format: GEOSEARCH key FROMLONLAT lon lat BYRADIUS radius unit
+      if (parsed.length >= 8) {
+        const key = parsed[1];
+        
+        // Parse FROMLONLAT option
+        const fromlonlatIndex = parsed.findIndex(p => p.toLowerCase() === "fromlonlat");
+        if (fromlonlatIndex === -1 || fromlonlatIndex + 2 >= parsed.length) {
+          connection.write("-ERR syntax error\r\n");
+          return;
+        }
+        
+        const centerLon = parseFloat(parsed[fromlonlatIndex + 1]);
+        const centerLat = parseFloat(parsed[fromlonlatIndex + 2]);
+        
+        // Parse BYRADIUS option
+        const byradiusIndex = parsed.findIndex(p => p.toLowerCase() === "byradius");
+        if (byradiusIndex === -1 || byradiusIndex + 2 >= parsed.length) {
+          connection.write("-ERR syntax error\r\n");
+          return;
+        }
+        
+        const radius = parseFloat(parsed[byradiusIndex + 1]);
+        const unit = parsed[byradiusIndex + 2].toLowerCase();
+        
+        // Convert radius to meters based on unit
+        let radiusInMeters = radius;
+        if (unit === "km") {
+          radiusInMeters = radius * 1000;
+        } else if (unit === "mi") {
+          radiusInMeters = radius * 1609.34;
+        } else if (unit === "ft") {
+          radiusInMeters = radius * 0.3048;
+        }
+        // else assume meters (m)
+        
+        // Get the sorted set
+        const sortedSet = sortedSets.get(key);
+        
+        if (!sortedSet) {
+          // Key doesn't exist - return empty array
+          connection.write("*0\r\n");
+          return;
+        }
+        
+        // Find all members within the radius
+        const matchingMembers: string[] = [];
+        
+        for (const member of sortedSet) {
+          // Decode geohash to get coordinates
+          const coords = decodeGeohash(member.score);
+          
+          // Calculate distance from center point
+          const distance = calculateDistance(
+            centerLon, centerLat,
+            coords.longitude, coords.latitude
+          );
+          
+          // If within radius, add to results
+          if (distance <= radiusInMeters) {
+            matchingMembers.push(member.member);
+          }
+        }
+        
+        // Return array of matching members
+        connection.write(encodeArray(matchingMembers));
+      }
     } else if (command === "set") {
       // SET requires two arguments: key and value
       // Optional: PX <milliseconds> or EX <seconds>
