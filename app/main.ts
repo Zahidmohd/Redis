@@ -358,6 +358,31 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           // Don't send response yet - will be sent when element is added or timeout expires
         }
       }
+    } else if (command === "type") {
+      // TYPE requires one argument: key
+      if (parsed.length >= 2) {
+        const key = parsed[1];
+        
+        // Check if key exists in string store
+        const storedValue = store.get(key);
+        if (storedValue) {
+          // Check if key has expired
+          if (storedValue.expiresAt && Date.now() > storedValue.expiresAt) {
+            // Key has expired, delete it and return none
+            store.delete(key);
+            connection.write("+none\r\n");
+          } else {
+            // Key is valid string
+            connection.write("+string\r\n");
+          }
+        } else if (lists.has(key)) {
+          // Key exists in lists
+          connection.write("+list\r\n");
+        } else {
+          // Key doesn't exist
+          connection.write("+none\r\n");
+        }
+      }
     } else if (command === "lrange") {
       // LRANGE requires three arguments: key, start, stop
       if (parsed.length >= 4) {
