@@ -1,6 +1,7 @@
 import * as net from "net";
 import * as fs from "fs";
 import * as path from "path";
+import * as crypto from "crypto";
 
 // You can use print statements as follows for debugging, they'll be visible when running tests.
 console.log("Logs from your program will appear here!");
@@ -233,10 +234,26 @@ interface SortedSetMember {
 }
 const sortedSets = new Map<string, SortedSetMember[]>();
 
+// ACL user storage
+interface User {
+  flags: string[];
+  passwords: string[];  // SHA-256 hashes
+}
+const users = new Map<string, User>();
+
+// Initialize default user with nopass flag
+users.set("default", {
+  flags: ["nopass"],
+  passwords: []
+});
+
 // Transaction state per connection
 const transactionState = new Map<net.Socket, boolean>();
 // Queued commands per connection
 const queuedCommands = new Map<net.Socket, string[][]>();
+
+// Authenticated user per connection (null = not authenticated)
+const authenticatedUser = new Map<net.Socket, string | null>();
 
 // Parse command-line arguments
 let serverPort = 6379; // Default port
@@ -694,6 +711,15 @@ function executeCommand(parsed: string[]): string {
 }
 
 const server: net.Server = net.createServer((connection: net.Socket) => {
+  // Initialize authentication for new connection
+  // Auto-authenticate as "default" if default user has "nopass" flag
+  const defaultUser = users.get("default");
+  if (defaultUser && defaultUser.flags.includes("nopass")) {
+    authenticatedUser.set(connection, "default");
+  } else {
+    authenticatedUser.set(connection, null);  // Not authenticated
+  }
+  
   // Handle connection
   connection.on("data", (data: Buffer) => {
     const parsed = parseRESP(data);
@@ -704,6 +730,16 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
     
     // Get command (case-insensitive)
     const command = parsed[0].toLowerCase();
+    
+    // Check authentication - some commands don't require authentication
+    const commandsWithoutAuth = ["auth", "hello"];  // Commands that work without authentication
+    const currentUser = authenticatedUser.get(connection);
+    
+    if (!currentUser && !commandsWithoutAuth.includes(command)) {
+      // Not authenticated and trying to execute a command that requires authentication
+      connection.write("-NOAUTH Authentication required.\r\n");
+      return;
+    }
     
     // Check if client is in subscribed mode
     const clientSubscriptions = subscriptions.get(connection);
@@ -792,6 +828,112 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         }
         
         connection.write(response);
+      }
+    } else if (command === "acl") {
+      // ACL command - Access Control List management
+      if (parsed.length >= 2 && parsed[1].toLowerCase() === "whoami") {
+        // ACL WHOAMI returns the username of the current connection
+        const username = authenticatedUser.get(connection);
+        connection.write(encodeBulkString(username || "default"));
+      } else if (parsed.length >= 3 && parsed[1].toLowerCase() === "getuser") {
+        // ACL GETUSER returns properties of a specified user
+        const username = parsed[2];
+        
+        // Get the user from storage
+        const user = users.get(username);
+        
+        if (!user) {
+          // User not found - for now just return empty response
+          // In real Redis, this would return an error
+          connection.write("$-1\r\n");
+          return;
+        }
+        
+        // Build response: ["flags", [flag1, flag2, ...], "passwords", [hash1, hash2, ...]]
+        let response = "*4\r\n";  // Array with 4 elements
+        
+        // First element: "flags"
+        response += encodeBulkString("flags");
+        
+        // Second element: array of flags
+        response += `*${user.flags.length}\r\n`;
+        for (const flag of user.flags) {
+          response += encodeBulkString(flag);
+        }
+        
+        // Third element: "passwords"
+        response += encodeBulkString("passwords");
+        
+        // Fourth element: array of password hashes
+        response += `*${user.passwords.length}\r\n`;
+        for (const passwordHash of user.passwords) {
+          response += encodeBulkString(passwordHash);
+        }
+        
+        connection.write(response);
+      } else if (parsed.length >= 3 && parsed[1].toLowerCase() === "setuser") {
+        // ACL SETUSER modifies a user's properties
+        const username = parsed[2];
+        
+        // Get or create the user
+        let user = users.get(username);
+        if (!user) {
+          user = { flags: [], passwords: [] };
+          users.set(username, user);
+        }
+        
+        // Process the rules (arguments after username)
+        for (let i = 3; i < parsed.length; i++) {
+          const rule = parsed[i];
+          
+          // Check if this is a password rule (starts with >)
+          if (rule.startsWith(">")) {
+            const password = rule.substring(1);  // Remove the > prefix
+            
+            // Compute SHA-256 hash of the password
+            const hash = crypto.createHash("sha256").update(password).digest("hex");
+            
+            // Add the hash to the passwords array
+            user.passwords.push(hash);
+            
+            // Remove the "nopass" flag if it exists
+            const nopassIndex = user.flags.indexOf("nopass");
+            if (nopassIndex !== -1) {
+              user.flags.splice(nopassIndex, 1);
+            }
+          }
+        }
+        
+        // Return OK
+        connection.write("+OK\r\n");
+      }
+    } else if (command === "auth") {
+      // AUTH command - authenticates the connection with a username and password
+      if (parsed.length >= 3) {
+        const username = parsed[1];
+        const password = parsed[2];
+        
+        // Get the user from storage
+        const user = users.get(username);
+        
+        if (!user) {
+          // User not found
+          connection.write("-WRONGPASS invalid username-password pair or user is disabled.\r\n");
+          return;
+        }
+        
+        // Compute SHA-256 hash of the provided password
+        const passwordHash = crypto.createHash("sha256").update(password).digest("hex");
+        
+        // Check if the hash exists in the user's passwords array
+        if (user.passwords.includes(passwordHash)) {
+          // Password matches - authenticate the connection
+          authenticatedUser.set(connection, username);
+          connection.write("+OK\r\n");
+        } else {
+          // Password doesn't match
+          connection.write("-WRONGPASS invalid username-password pair or user is disabled.\r\n");
+        }
       }
     } else if (command === "replconf") {
       // REPLCONF command - used during replication handshake
@@ -2211,6 +2353,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
     transactionState.delete(connection);
     queuedCommands.delete(connection);
     subscriptions.delete(connection);
+    authenticatedUser.delete(connection);
     
     // Remove from replicas list if this was a replica connection
     const replicaIndex = replicas.indexOf(connection);
