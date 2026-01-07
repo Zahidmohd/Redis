@@ -66,6 +66,47 @@ const store = new Map<string, StoredValue>();
 // In-memory storage for lists
 const lists = new Map<string, string[]>();
 
+// Blocked clients waiting for BLPOP
+interface BlockedClient {
+  socket: net.Socket;
+  key: string;
+  timestamp: number;
+}
+const blockedClients = new Map<string, BlockedClient[]>();
+
+// Helper function to wake up blocked clients when elements are added
+function wakeUpBlockedClients(key: string): void {
+  const blocked = blockedClients.get(key);
+  if (!blocked || blocked.length === 0) {
+    return;
+  }
+  
+  const list = lists.get(key);
+  if (!list || list.length === 0) {
+    return;
+  }
+  
+  // Wake up clients in FIFO order while there are elements
+  while (blocked.length > 0 && list.length > 0) {
+    const client = blocked.shift()!;
+    const element = list.shift()!;
+    
+    // Send response: [key, element]
+    const response = encodeArray([key, element]);
+    client.socket.write(response);
+    
+    // Clean up empty list
+    if (list.length === 0) {
+      lists.delete(key);
+    }
+  }
+  
+  // Clean up empty blocked clients array
+  if (blocked.length === 0) {
+    blockedClients.delete(key);
+  }
+}
+
 const server: net.Server = net.createServer((connection: net.Socket) => {
   // Handle connection
   connection.on("data", (data: Buffer) => {
@@ -151,8 +192,14 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         // Push all values to the right (end) of the list
         list.push(...values);
         
-        // Return the length of the list as a RESP integer
-        connection.write(encodeInteger(list.length));
+        // Capture the length BEFORE waking up blocked clients
+        const lengthAfterPush = list.length;
+        
+        // Wake up any blocked clients waiting for this list
+        wakeUpBlockedClients(key);
+        
+        // Return the length of the list after push (before clients consumed elements)
+        connection.write(encodeInteger(lengthAfterPush));
       }
     } else if (command === "lpush") {
       // LPUSH requires at least two arguments: key and one or more values
@@ -173,8 +220,14 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           list.unshift(value);
         }
         
-        // Return the length of the list as a RESP integer
-        connection.write(encodeInteger(list.length));
+        // Capture the length BEFORE waking up blocked clients
+        const lengthAfterPush = list.length;
+        
+        // Wake up any blocked clients waiting for this list
+        wakeUpBlockedClients(key);
+        
+        // Return the length of the list after push (before clients consumed elements)
+        connection.write(encodeInteger(lengthAfterPush));
       }
     } else if (command === "llen") {
       // LLEN requires one argument: key
@@ -232,6 +285,43 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           if (list.length === 0) {
             lists.delete(key);
           }
+        }
+      }
+    } else if (command === "blpop") {
+      // BLPOP requires two arguments: key and timeout
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const timeout = parseInt(parsed[2]); // For now, we only handle timeout = 0 (indefinite)
+        
+        const list = lists.get(key);
+        
+        // If list has elements, pop immediately
+        if (list && list.length > 0) {
+          const element = list.shift()!;
+          
+          // Return [key, element] as RESP array
+          connection.write(encodeArray([key, element]));
+          
+          // Clean up empty list
+          if (list.length === 0) {
+            lists.delete(key);
+          }
+        } else {
+          // No elements available, block the client
+          let blocked = blockedClients.get(key);
+          if (!blocked) {
+            blocked = [];
+            blockedClients.set(key, blocked);
+          }
+          
+          // Add client to blocked queue with timestamp for FIFO ordering
+          blocked.push({
+            socket: connection,
+            key: key,
+            timestamp: Date.now()
+          });
+          
+          // Don't send response yet - will be sent when element is added
         }
       }
     } else if (command === "lrange") {
