@@ -658,6 +658,9 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         };
         stream.push(entry);
         
+        // Wake up any blocked XREAD clients waiting for this stream
+        wakeUpBlockedXReadClients(streamKey);
+        
         // Return the entry ID as a bulk string
         connection.write(encodeBulkString(entryId));
       }
@@ -728,10 +731,20 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       
       connection.write(response);
     } else if (command === "xread") {
-      // XREAD STREAMS <key1> <key2> ... <id1> <id2> ...
+      // XREAD [BLOCK <milliseconds>] STREAMS <key1> <key2> ... <id1> <id2> ...
+      
+      // Check for BLOCK option
+      let blockTimeout: number | null = null;
+      let commandStart = 1;
+      
+      if (parsed.length > 2 && parsed[1].toLowerCase() === 'block') {
+        blockTimeout = parseInt(parsed[2]);
+        commandStart = 3;
+      }
+      
       // Find the STREAMS keyword
       let streamsIndex = -1;
-      for (let i = 1; i < parsed.length; i++) {
+      for (let i = commandStart; i < parsed.length; i++) {
         if (parsed[i].toLowerCase() === 'streams') {
           streamsIndex = i;
           break;
@@ -791,46 +804,75 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         }
       }
       
-      // If no streams have results, return empty array
-      if (streamResults.length === 0) {
+      // If we have results, return immediately
+      if (streamResults.length > 0) {
+        // Encode response as RESP nested array
+        // Format: [[stream_key, [[id, [field, value, ...]], ...]], ...]
+        let response = `*${streamResults.length}\r\n`;
+        
+        for (const streamResult of streamResults) {
+          // Stream element: [stream_key, entries_array]
+          response += "*2\r\n";
+          
+          // Element 1: Stream key as bulk string
+          response += encodeBulkString(streamResult.key);
+          
+          // Element 2: Array of entries
+          response += `*${streamResult.entries.length}\r\n`;
+          for (const entry of streamResult.entries) {
+            // Each entry is [id, [field1, value1, ...]]
+            response += "*2\r\n";
+            
+            // Entry ID
+            response += encodeBulkString(entry.id);
+            
+            // Fields array
+            const fieldValues: string[] = [];
+            for (const [field, value] of entry.fields) {
+              fieldValues.push(field);
+              fieldValues.push(value);
+            }
+            response += `*${fieldValues.length}\r\n`;
+            for (const item of fieldValues) {
+              response += encodeBulkString(item);
+            }
+          }
+        }
+        
+        connection.write(response);
+        return;
+      }
+      
+      // No results available
+      // If BLOCK is not specified, return empty array
+      if (blockTimeout === null) {
         connection.write("*0\r\n");
         return;
       }
       
-      // Encode response as RESP nested array
-      // Format: [[stream_key, [[id, [field, value, ...]], ...]], ...]
-      let response = `*${streamResults.length}\r\n`;
+      // Block the client
+      const blockedClient: BlockedXReadClient = {
+        socket: connection,
+        streamKeys,
+        afterIds,
+        timestamp: Date.now()
+      };
       
-      for (const streamResult of streamResults) {
-        // Stream element: [stream_key, entries_array]
-        response += "*2\r\n";
-        
-        // Element 1: Stream key as bulk string
-        response += encodeBulkString(streamResult.key);
-        
-        // Element 2: Array of entries
-        response += `*${streamResult.entries.length}\r\n`;
-        for (const entry of streamResult.entries) {
-          // Each entry is [id, [field1, value1, ...]]
-          response += "*2\r\n";
-          
-          // Entry ID
-          response += encodeBulkString(entry.id);
-          
-          // Fields array
-          const fieldValues: string[] = [];
-          for (const [field, value] of entry.fields) {
-            fieldValues.push(field);
-            fieldValues.push(value);
+      // Set up timeout if non-zero
+      if (blockTimeout > 0) {
+        blockedClient.timeoutId = setTimeout(() => {
+          // Remove from blocked list
+          const index = blockedXReadClients.indexOf(blockedClient);
+          if (index !== -1) {
+            blockedXReadClients.splice(index, 1);
           }
-          response += `*${fieldValues.length}\r\n`;
-          for (const item of fieldValues) {
-            response += encodeBulkString(item);
-          }
-        }
+          
+          // Send null array response
+          connection.write("*-1\r\n");
+        }, blockTimeout);
       }
       
-      connection.write(response);
+      blockedXReadClients.push(blockedClient);
     } else if (command === "lrange") {
       // LRANGE requires three arguments: key, start, stop
       if (parsed.length >= 4) {
