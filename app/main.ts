@@ -1021,8 +1021,8 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       // ZRANGE command - list members in a sorted set by index range
       if (parsed.length >= 4) {
         const key = parsed[1];
-        const startIndex = parseInt(parsed[2]);
-        const stopIndex = parseInt(parsed[3]);
+        let startIndex = parseInt(parsed[2]);
+        let stopIndex = parseInt(parsed[3]);
         
         // Check if sorted set exists
         const sortedSet = sortedSets.get(key);
@@ -1034,6 +1034,23 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         
         // Get the cardinality (size) of the sorted set
         const cardinality = sortedSet.length;
+        
+        // Convert negative indexes to positive
+        if (startIndex < 0) {
+          startIndex = cardinality + startIndex;
+          // If still negative (out of range), clamp to 0
+          if (startIndex < 0) {
+            startIndex = 0;
+          }
+        }
+        
+        if (stopIndex < 0) {
+          stopIndex = cardinality + stopIndex;
+          // If still negative (out of range), clamp to 0
+          if (stopIndex < 0) {
+            stopIndex = 0;
+          }
+        }
         
         // If start index >= cardinality, return empty array
         if (startIndex >= cardinality) {
@@ -1055,6 +1072,74 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         
         // Return as RESP array
         connection.write(encodeArray(members));
+      }
+    } else if (command === "zcard") {
+      // ZCARD command - get the cardinality (number of elements) of a sorted set
+      if (parsed.length >= 2) {
+        const key = parsed[1];
+        
+        // Check if sorted set exists
+        const sortedSet = sortedSets.get(key);
+        if (!sortedSet) {
+          // Sorted set doesn't exist - return 0
+          connection.write(encodeInteger(0));
+        } else {
+          // Return the number of elements
+          connection.write(encodeInteger(sortedSet.length));
+        }
+      }
+    } else if (command === "zscore") {
+      // ZSCORE command - get the score of a member in a sorted set
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const member = parsed[2];
+        
+        // Check if sorted set exists
+        const sortedSet = sortedSets.get(key);
+        if (!sortedSet) {
+          // Sorted set doesn't exist - return null bulk string
+          connection.write("$-1\r\n");
+          return;
+        }
+        
+        // Find the member in the sorted set
+        const foundMember = sortedSet.find(m => m.member === member);
+        
+        if (!foundMember) {
+          // Member doesn't exist - return null bulk string
+          connection.write("$-1\r\n");
+        } else {
+          // Return the score as a bulk string
+          const scoreStr = foundMember.score.toString();
+          connection.write(encodeBulkString(scoreStr));
+        }
+      }
+    } else if (command === "zrem") {
+      // ZREM command - remove a member from a sorted set
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const member = parsed[2];
+        
+        // Check if sorted set exists
+        const sortedSet = sortedSets.get(key);
+        if (!sortedSet) {
+          // Sorted set doesn't exist - return 0
+          connection.write(encodeInteger(0));
+          return;
+        }
+        
+        // Find the index of the member in the sorted set
+        const memberIndex = sortedSet.findIndex(m => m.member === member);
+        
+        if (memberIndex === -1) {
+          // Member doesn't exist - return 0
+          connection.write(encodeInteger(0));
+        } else {
+          // Remove the member from the sorted set
+          sortedSet.splice(memberIndex, 1);
+          // Return 1 (number of members removed)
+          connection.write(encodeInteger(1));
+        }
       }
     } else if (command === "set") {
       // SET requires two arguments: key and value
