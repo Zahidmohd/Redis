@@ -399,6 +399,51 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         const streamKey = parsed[1];
         const entryId = parsed[2];
         
+        // Parse entry ID into milliseconds and sequence number
+        const idParts = entryId.split('-');
+        if (idParts.length !== 2) {
+          connection.write("-ERR Invalid stream ID specified as stream command argument\r\n");
+          return;
+        }
+        
+        const msTime = parseInt(idParts[0]);
+        const seqNum = parseInt(idParts[1]);
+        
+        // Check if ID is 0-0 (always invalid)
+        if (msTime === 0 && seqNum === 0) {
+          connection.write("-ERR The ID specified in XADD must be greater than 0-0\r\n");
+          return;
+        }
+        
+        // Get or create the stream
+        let stream = streams.get(streamKey);
+        if (!stream) {
+          stream = [];
+          streams.set(streamKey, stream);
+        }
+        
+        // Validate ID if stream has entries
+        if (stream.length > 0) {
+          const lastEntry = stream[stream.length - 1];
+          const lastIdParts = lastEntry.id.split('-');
+          const lastMsTime = parseInt(lastIdParts[0]);
+          const lastSeqNum = parseInt(lastIdParts[1]);
+          
+          // ID must be strictly greater than last entry's ID
+          // Compare milliseconds time first
+          if (msTime < lastMsTime) {
+            connection.write("-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n");
+            return;
+          } else if (msTime === lastMsTime) {
+            // If times are equal, sequence number must be greater
+            if (seqNum <= lastSeqNum) {
+              connection.write("-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n");
+              return;
+            }
+          }
+          // If msTime > lastMsTime, any sequence number is valid
+        }
+        
         // Parse field-value pairs
         const fields = new Map<string, string>();
         for (let i = 3; i < parsed.length; i += 2) {
@@ -407,13 +452,6 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
             const value = parsed[i + 1];
             fields.set(field, value);
           }
-        }
-        
-        // Get or create the stream
-        let stream = streams.get(streamKey);
-        if (!stream) {
-          stream = [];
-          streams.set(streamKey, stream);
         }
         
         // Create and add the entry
