@@ -41,8 +41,13 @@ function encodeBulkString(str: string | null): string {
   return `$${str.length}\r\n${str}\r\n`;
 }
 
-// In-memory storage for key-value pairs
-const store = new Map<string, string>();
+// In-memory storage for key-value pairs with expiry
+interface StoredValue {
+  value: string;
+  expiresAt?: number; // Timestamp in milliseconds when the key expires
+}
+
+const store = new Map<string, StoredValue>();
 
 const server: net.Server = net.createServer((connection: net.Socket) => {
   // Handle connection
@@ -66,18 +71,52 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       }
     } else if (command === "set") {
       // SET requires two arguments: key and value
+      // Optional: PX <milliseconds> or EX <seconds>
       if (parsed.length >= 3) {
         const key = parsed[1];
         const value = parsed[2];
-        store.set(key, value);
+        
+        let expiresAt: number | undefined = undefined;
+        
+        // Parse optional arguments
+        for (let i = 3; i < parsed.length; i += 2) {
+          const option = parsed[i].toLowerCase();
+          const optionValue = parsed[i + 1];
+          
+          if (option === "px" && optionValue) {
+            // PX option: expiry in milliseconds
+            const milliseconds = parseInt(optionValue);
+            expiresAt = Date.now() + milliseconds;
+          } else if (option === "ex" && optionValue) {
+            // EX option: expiry in seconds
+            const seconds = parseInt(optionValue);
+            expiresAt = Date.now() + (seconds * 1000);
+          }
+        }
+        
+        store.set(key, { value, expiresAt });
         connection.write("+OK\r\n");
       }
     } else if (command === "get") {
       // GET requires one argument: key
       if (parsed.length >= 2) {
         const key = parsed[1];
-        const value = store.get(key);
-        connection.write(encodeBulkString(value ?? null));
+        const storedValue = store.get(key);
+        
+        // Check if key exists and hasn't expired
+        if (storedValue) {
+          if (storedValue.expiresAt && Date.now() > storedValue.expiresAt) {
+            // Key has expired, delete it and return null
+            store.delete(key);
+            connection.write(encodeBulkString(null));
+          } else {
+            // Key is valid, return the value
+            connection.write(encodeBulkString(storedValue.value));
+          }
+        } else {
+          // Key doesn't exist
+          connection.write(encodeBulkString(null));
+        }
       }
     }
   });
