@@ -366,6 +366,9 @@ const sortedSets = new Map<string, SortedSetMember[]>();
 // Sets storage (unordered collection of unique strings)
 const sets = new Map<string, Set<string>>();
 
+// Hashes storage (maps field names to values)
+const hashes = new Map<string, Map<string, string>>();
+
 // Bloom filters storage
 const bloomFilters = new Map<string, BloomFilter>();
 
@@ -649,6 +652,31 @@ function loadAOF(): void {
         }
         for (let i = 2; i < parsed.length; i++) {
           list.push(parsed[i]);
+        }
+        incrementKeyVersion(key);
+      } else if (command === "hset" && parsed.length >= 4) {
+        const key = parsed[1];
+        let hash = hashes.get(key);
+        if (!hash) {
+          hash = new Map<string, string>();
+          hashes.set(key, hash);
+        }
+        for (let i = 2; i < parsed.length; i += 2) {
+          if (i + 1 < parsed.length) {
+            hash.set(parsed[i], parsed[i + 1]);
+          }
+        }
+        incrementKeyVersion(key);
+      } else if (command === "hdel" && parsed.length >= 3) {
+        const key = parsed[1];
+        const hash = hashes.get(key);
+        if (hash) {
+          for (let i = 2; i < parsed.length; i++) {
+            hash.delete(parsed[i]);
+          }
+          if (hash.size === 0) {
+            hashes.delete(key);
+          }
         }
         incrementKeyVersion(key);
       }
@@ -2945,6 +2973,294 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         // Return length of result
         connection.write(encodeInteger(result.length));
       }
+    } else if (command === "hset") {
+      // HSET command - set hash field
+      // Format: HSET key field value [field value ...]
+      if (parsed.length >= 4 && (parsed.length % 2) === 0) {
+        const key = parsed[1];
+        
+        // Get or create hash
+        let hash = hashes.get(key);
+        if (!hash) {
+          hash = new Map<string, string>();
+          hashes.set(key, hash);
+        }
+        
+        // Set fields and count newly added fields
+        let addedCount = 0;
+        for (let i = 2; i < parsed.length; i += 2) {
+          const field = parsed[i];
+          const value = parsed[i + 1];
+          
+          if (!hash.has(field)) {
+            addedCount++;
+          }
+          hash.set(field, value);
+        }
+        
+        incrementKeyVersion(key);
+        appendToAOF(parsed);
+        
+        // Return number of fields added (not updated)
+        connection.write(encodeInteger(addedCount));
+      }
+    } else if (command === "hget") {
+      // HGET command - get hash field value
+      // Format: HGET key field
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const field = parsed[2];
+        
+        const hash = hashes.get(key);
+        
+        if (!hash || !hash.has(field)) {
+          connection.write(encodeNull(connection));
+        } else {
+          connection.write(encodeBulkString(hash.get(field)!));
+        }
+      }
+    } else if (command === "hgetall") {
+      // HGETALL command - get all fields and values
+      // Format: HGETALL key
+      if (parsed.length >= 2) {
+        const key = parsed[1];
+        const hash = hashes.get(key);
+        
+        if (!hash || hash.size === 0) {
+          connection.write("*0\r\n");
+        } else {
+          // Return alternating field-value pairs
+          const items: string[] = [];
+          for (const [field, value] of hash) {
+            items.push(field);
+            items.push(value);
+          }
+          connection.write(encodeArray(items));
+        }
+      }
+    } else if (command === "hdel") {
+      // HDEL command - delete hash fields
+      // Format: HDEL key field [field ...]
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const fields = parsed.slice(2);
+        const hash = hashes.get(key);
+        
+        if (!hash) {
+          connection.write(encodeInteger(0));
+        } else {
+          let deletedCount = 0;
+          for (const field of fields) {
+            if (hash.delete(field)) {
+              deletedCount++;
+            }
+          }
+          
+          // Clean up empty hash
+          if (hash.size === 0) {
+            hashes.delete(key);
+          }
+          
+          if (deletedCount > 0) {
+            incrementKeyVersion(key);
+            appendToAOF(parsed);
+          }
+          
+          connection.write(encodeInteger(deletedCount));
+        }
+      }
+    } else if (command === "hexists") {
+      // HEXISTS command - check if field exists
+      // Format: HEXISTS key field
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const field = parsed[2];
+        const hash = hashes.get(key);
+        
+        if (hash && hash.has(field)) {
+          connection.write(encodeInteger(1));
+        } else {
+          connection.write(encodeInteger(0));
+        }
+      }
+    } else if (command === "hkeys") {
+      // HKEYS command - get all field names
+      // Format: HKEYS key
+      if (parsed.length >= 2) {
+        const key = parsed[1];
+        const hash = hashes.get(key);
+        
+        if (!hash || hash.size === 0) {
+          connection.write("*0\r\n");
+        } else {
+          const fields = Array.from(hash.keys());
+          connection.write(encodeArray(fields));
+        }
+      }
+    } else if (command === "hvals") {
+      // HVALS command - get all values
+      // Format: HVALS key
+      if (parsed.length >= 2) {
+        const key = parsed[1];
+        const hash = hashes.get(key);
+        
+        if (!hash || hash.size === 0) {
+          connection.write("*0\r\n");
+        } else {
+          const values = Array.from(hash.values());
+          connection.write(encodeArray(values));
+        }
+      }
+    } else if (command === "hlen") {
+      // HLEN command - get number of fields
+      // Format: HLEN key
+      if (parsed.length >= 2) {
+        const key = parsed[1];
+        const hash = hashes.get(key);
+        
+        if (!hash) {
+          connection.write(encodeInteger(0));
+        } else {
+          connection.write(encodeInteger(hash.size));
+        }
+      }
+    } else if (command === "hincrby") {
+      // HINCRBY command - increment hash field by integer
+      // Format: HINCRBY key field increment
+      if (parsed.length >= 4) {
+        const key = parsed[1];
+        const field = parsed[2];
+        const increment = parseInt(parsed[3]);
+        
+        if (isNaN(increment)) {
+          connection.write("-ERR value is not an integer or out of range\r\n");
+          return;
+        }
+        
+        // Get or create hash
+        let hash = hashes.get(key);
+        if (!hash) {
+          hash = new Map<string, string>();
+          hashes.set(key, hash);
+        }
+        
+        // Get current value or default to 0
+        const currentStr = hash.get(field) || "0";
+        const current = parseInt(currentStr);
+        
+        if (isNaN(current) || !/^-?\d+$/.test(currentStr.trim())) {
+          connection.write("-ERR hash value is not an integer\r\n");
+          return;
+        }
+        
+        const newValue = current + increment;
+        hash.set(field, newValue.toString());
+        
+        incrementKeyVersion(key);
+        appendToAOF(parsed);
+        
+        connection.write(encodeInteger(newValue));
+      }
+    } else if (command === "hincrbyfloat") {
+      // HINCRBYFLOAT command - increment hash field by float
+      // Format: HINCRBYFLOAT key field increment
+      if (parsed.length >= 4) {
+        const key = parsed[1];
+        const field = parsed[2];
+        const increment = parseFloat(parsed[3]);
+        
+        if (isNaN(increment)) {
+          connection.write("-ERR value is not a valid float\r\n");
+          return;
+        }
+        
+        // Get or create hash
+        let hash = hashes.get(key);
+        if (!hash) {
+          hash = new Map<string, string>();
+          hashes.set(key, hash);
+        }
+        
+        // Get current value or default to 0
+        const currentStr = hash.get(field) || "0";
+        const current = parseFloat(currentStr);
+        
+        if (isNaN(current)) {
+          connection.write("-ERR hash value is not a float\r\n");
+          return;
+        }
+        
+        const newValue = current + increment;
+        hash.set(field, newValue.toString());
+        
+        incrementKeyVersion(key);
+        appendToAOF(parsed);
+        
+        connection.write(encodeBulkString(newValue.toString()));
+      }
+    } else if (command === "hmget") {
+      // HMGET command - get multiple hash field values
+      // Format: HMGET key field [field ...]
+      if (parsed.length >= 3) {
+        const key = parsed[1];
+        const fields = parsed.slice(2);
+        const hash = hashes.get(key);
+        
+        const values: string[] = [];
+        for (const field of fields) {
+          if (hash && hash.has(field)) {
+            values.push(hash.get(field)!);
+          } else {
+            // Use null representation based on protocol version
+            const version = protocolVersion.get(connection) || 2;
+            if (version === 3) {
+              values.push("_RESP3NULL_"); // Placeholder
+            } else {
+              values.push("$-1\r\n"); // Will be handled differently
+            }
+          }
+        }
+        
+        // Build response array with proper null handling
+        let response = `*${values.length}\r\n`;
+        for (const value of values) {
+          if (value === "_RESP3NULL_") {
+            response += encodeRESP3Null();
+          } else if (value === "$-1\r\n") {
+            response += "$-1\r\n";
+          } else {
+            response += encodeBulkString(value);
+          }
+        }
+        
+        connection.write(response);
+      }
+    } else if (command === "hsetnx") {
+      // HSETNX command - set field only if it doesn't exist
+      // Format: HSETNX key field value
+      if (parsed.length >= 4) {
+        const key = parsed[1];
+        const field = parsed[2];
+        const value = parsed[3];
+        
+        // Get or create hash
+        let hash = hashes.get(key);
+        if (!hash) {
+          hash = new Map<string, string>();
+          hashes.set(key, hash);
+        }
+        
+        if (hash.has(field)) {
+          // Field exists, do nothing
+          connection.write(encodeInteger(0));
+        } else {
+          // Field doesn't exist, set it
+          hash.set(field, value);
+          incrementKeyVersion(key);
+          appendToAOF(parsed);
+          connection.write(encodeInteger(1));
+        }
+      }
     } else if (command === "rpush") {
       // RPUSH requires at least two arguments: key and one or more values
       if (parsed.length >= 3) {
@@ -3156,6 +3472,9 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         } else if (sets.has(key)) {
           // Key exists in sets
           connection.write("+set\r\n");
+        } else if (hashes.has(key)) {
+          // Key exists in hashes
+          connection.write("+hash\r\n");
         } else if (bloomFilters.has(key)) {
           // Key exists in bloom filters
           connection.write("+MBbloom--\r\n");
