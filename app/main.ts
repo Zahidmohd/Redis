@@ -392,6 +392,12 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
       // REPLCONF command - used during replication handshake
       // For now, we just acknowledge with OK regardless of arguments
       connection.write("+OK\r\n");
+    } else if (command === "psync") {
+      // PSYNC command - used during replication handshake
+      // Replica sends PSYNC ? -1 for full resynchronization
+      // Respond with FULLRESYNC <REPL_ID> <OFFSET>
+      const response = `+FULLRESYNC ${masterReplId} ${masterReplOffset}\r\n`;
+      connection.write(response);
     } else if (command === "multi") {
       // Start a transaction
       transactionState.set(connection, true);
