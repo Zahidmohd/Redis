@@ -404,19 +404,20 @@ bash test_concurrent_watch.sh
 .
 ├── app/
 │   └── main.ts              # Main server implementation
+├── doc/                     # Documentation folder
+│   ├── RESP3_IMPLEMENTATION.md # RESP3 protocol docs
+│   ├── BLOOM_FILTERS.md        # Bloom filters docs
+│   ├── AOF_PERSISTENCE.md      # AOF persistence docs
+│   ├── HASHES.md               # Hashes data type docs
+│   ├── LUA_SCRIPTING.md        # Lua scripting docs
+│   ├── COMMAND_METADATA.md     # Command introspection docs
+│   └── FEATURES_SUMMARY.md     # Complete features summary
 ├── your_program.sh          # Entry point script
 ├── package.json             # Dependencies
 ├── bun.lockb               # Bun lockfile
 ├── tsconfig.json           # TypeScript configuration
 ├── .gitignore              # Git ignore rules
-├── README.md               # This file
-├── project_plan.md         # Detailed implementation plan
-├── RESP3_IMPLEMENTATION.md # RESP3 docs
-├── BLOOM_FILTERS.md        # Bloom filters docs
-├── AOF_PERSISTENCE.md      # AOF docs
-├── HASHES.md               # Hashes docs
-├── LUA_SCRIPTING.md        # Lua scripting docs
-└── COMMAND_METADATA.md     # Command introspection docs
+└── README.md               # This file
 ```
 
 ## 🛠️ Development

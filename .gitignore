@@ -1,10 +1,8 @@
 node_modules/
 package-lock.json
 
-# Ignore all markdown files except README.md
-*.md
-!README.md
-doc/
+# Ignore only project_plan.md
+project_plan.md
 
 # Test scripts (temporary)
 test_optimistic_locking.sh
