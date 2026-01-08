@@ -347,6 +347,8 @@ function executeLuaScript(script: string, keys: string[], argv: string[], connec
     let jsCode = script
       // Replace Lua comments with JS comments
       .replace(/--/g, '//')
+      // Replace 'local' with 'let'
+      .replace(/\blocal\b/g, 'let')
       // Replace redis.call with our function
       .replace(/redis\.call/g, 'redisCall')
       .replace(/redis\.pcall/g, 'redisCall')
@@ -354,10 +356,15 @@ function executeLuaScript(script: string, keys: string[], argv: string[], connec
       // This is simplified - real implementation would need proper parsing
       .replace(/KEYS\[(\d+)\]/g, (_, n) => `KEYS[${parseInt(n) - 1}]`)
       .replace(/ARGV\[(\d+)\]/g, (_, n) => `ARGV[${parseInt(n) - 1}]`)
-      // Replace Lua return with JS return
+      // Replace Lua return with JS return (handle both at start and after semicolon)
       .replace(/^return\s+/m, 'return ')
+      .replace(/;\s*return\s+/g, '; return ')
       // Handle Lua string concatenation
-      .replace(/\.\./g, '+');
+      .replace(/\.\./g, '+')
+      // Replace tonumber() with Number()
+      .replace(/tonumber\(/g, 'Number(')
+      // Replace tostring() with String()
+      .replace(/tostring\(/g, 'String(');
     
     // Execute the script
     const result = eval(`(function() { 
@@ -2665,29 +2672,11 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         }
       }
     } else if (command === "geoadd") {
-      // GEOADD command - add a geospatial location
-      // Format: GEOADD key longitude latitude member
-      if (parsed.length >= 5) {
+      // GEOADD command - add geospatial locations
+      // Format: GEOADD key longitude latitude member [longitude latitude member ...]
+      if (parsed.length >= 5 && (parsed.length - 2) % 3 === 0) {
         const key = parsed[1];
-        const longitude = parseFloat(parsed[2]);
-        const latitude = parseFloat(parsed[3]);
-        const member = parsed[4];
-        
-        // Validate longitude: -180 to +180 (inclusive)
-        if (longitude < -180 || longitude > 180) {
-          connection.write(`-ERR invalid longitude,latitude pair ${longitude},${latitude}\r\n`);
-          return;
-        }
-        
-        // Validate latitude: -85.05112878 to +85.05112878 (inclusive)
-        if (latitude < -85.05112878 || latitude > 85.05112878) {
-          connection.write(`-ERR invalid longitude,latitude pair ${longitude},${latitude}\r\n`);
-          return;
-        }
-        
-        // Store location in sorted set
-        // Calculate geohash score from longitude and latitude
-        const score = encodeGeohash(longitude, latitude);
+        let totalNewMembersAdded = 0;
         
         // Get or create sorted set
         let sortedSet = sortedSets.get(key);
@@ -2696,52 +2685,78 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           sortedSets.set(key, sortedSet);
         }
         
-        // Check if member already exists
-        const existingIndex = sortedSet.findIndex(m => m.member === member);
-        let newMembersAdded = 0;
-        
-        if (existingIndex === -1) {
-          // New member - add it in sorted position
-          newMembersAdded = 1;
+        // Process each longitude, latitude, member triplet
+        for (let i = 2; i < parsed.length; i += 3) {
+          const longitude = parseFloat(parsed[i]);
+          const latitude = parseFloat(parsed[i + 1]);
+          const member = parsed[i + 2];
           
-          // Find the correct position to insert (maintain sorted order by score, then lexicographically)
-          let insertIndex = 0;
-          for (let i = 0; i < sortedSet.length; i++) {
-            if (sortedSet[i].score > score) {
-              break;
-            } else if (sortedSet[i].score === score && sortedSet[i].member > member) {
-              break;
-            }
-            insertIndex = i + 1;
+          // Validate longitude: -180 to +180 (inclusive)
+          if (longitude < -180 || longitude > 180) {
+            connection.write(`-ERR invalid longitude,latitude pair ${longitude},${latitude}\r\n`);
+            return;
           }
           
-          // Insert at the correct position
-          sortedSet.splice(insertIndex, 0, { member, score });
-        } else {
-          // Member exists - update score if different
-          if (sortedSet[existingIndex].score !== score) {
-            // Remove old entry
-            sortedSet.splice(existingIndex, 1);
+          // Validate latitude: -85.05112878 to +85.05112878 (inclusive)
+          if (latitude < -85.05112878 || latitude > 85.05112878) {
+            connection.write(`-ERR invalid longitude,latitude pair ${longitude},${latitude}\r\n`);
+            return;
+          }
+          
+          // Calculate geohash score from longitude and latitude
+          const score = encodeGeohash(longitude, latitude);
+          
+          // Check if member already exists
+          const existingIndex = sortedSet.findIndex(m => m.member === member);
+          
+          if (existingIndex === -1) {
+            // New member - add it in sorted position
+            totalNewMembersAdded++;
             
-            // Find new position and insert
+            // Find the correct position to insert (maintain sorted order by score, then lexicographically)
             let insertIndex = 0;
-            for (let i = 0; i < sortedSet.length; i++) {
-              if (sortedSet[i].score > score) {
+            for (let j = 0; j < sortedSet.length; j++) {
+              if (sortedSet[j].score > score) {
                 break;
-              } else if (sortedSet[i].score === score && sortedSet[i].member > member) {
+              } else if (sortedSet[j].score === score && sortedSet[j].member > member) {
                 break;
               }
-              insertIndex = i + 1;
+              insertIndex = j + 1;
             }
+            
+            // Insert at the correct position
             sortedSet.splice(insertIndex, 0, { member, score });
+          } else {
+            // Member exists - update score if different
+            if (sortedSet[existingIndex].score !== score) {
+              // Remove old entry
+              sortedSet.splice(existingIndex, 1);
+              
+              // Find new position and insert
+              let insertIndex = 0;
+              for (let j = 0; j < sortedSet.length; j++) {
+                if (sortedSet[j].score > score) {
+                  break;
+                } else if (sortedSet[j].score === score && sortedSet[j].member > member) {
+                  break;
+                }
+                insertIndex = j + 1;
+              }
+              sortedSet.splice(insertIndex, 0, { member, score });
+            }
+            // totalNewMembersAdded remains unchanged since member already existed
           }
-          // newMembersAdded remains 0 since member already existed
         }
         
         incrementKeyVersion(key); // Track modification for WATCH
         
-        // Return the number of new members added
-        connection.write(encodeInteger(newMembersAdded));
+        // Log to AOF
+        if (appendonly) {
+          appendToAOF(parsed);
+        }
+        
+        // Return the total number of new members added
+        connection.write(encodeInteger(totalNewMembersAdded));
       }
     } else if (command === "geopos") {
       // GEOPOS command - get the longitude and latitude of locations
@@ -2783,8 +2798,7 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         const key = parsed[1];
         const member1 = parsed[2];
         const member2 = parsed[3];
-        // Unit is optional (m, km, ft, mi), default is meters
-        // For now we'll just handle meters
+        const unit = parsed.length >= 5 ? parsed[4].toLowerCase() : "m";
         
         // Get the sorted set
         const sortedSet = sortedSets.get(key);
@@ -2809,14 +2823,38 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
         const coords1 = decodeGeohash(foundMember1.score);
         const coords2 = decodeGeohash(foundMember2.score);
         
-        // Calculate distance using Haversine formula
-        const distance = calculateDistance(
+        // Calculate distance using Haversine formula (returns meters)
+        let distance = calculateDistance(
           coords1.longitude, coords1.latitude,
           coords2.longitude, coords2.latitude
         );
         
+        // Convert to requested unit
+        switch (unit) {
+          case "km":
+            distance = distance / 1000;
+            break;
+          case "mi":
+            distance = distance / 1609.34;
+            break;
+          case "ft":
+            distance = distance * 3.28084;
+            break;
+          case "m":
+          default:
+            // Already in meters
+            break;
+        }
+        
         // Return distance as bulk string
-        connection.write(encodeBulkString(distance.toString()));
+        const version = protocolVersion.get(connection) || 2;
+        if (version === 3) {
+          // RESP3: return as Double type
+          connection.write(encodeRESP3Double(distance));
+        } else {
+          // RESP2: return as bulk string
+          connection.write(encodeBulkString(distance.toFixed(3)));
+        }
       }
     } else if (command === "geosearch") {
       // GEOSEARCH command - search for locations within a radius

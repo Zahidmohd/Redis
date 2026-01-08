@@ -1,8 +1,9 @@
 node_modules/
 package-lock.json
 
-# Ignore only project_plan.md
+# Ignore project plan and demo guide
 project_plan.md
+DEMO_TESTING_GUIDE.md
 
 # Test scripts (temporary)
 test_optimistic_locking.sh
