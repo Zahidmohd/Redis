@@ -2852,8 +2852,8 @@ const server: net.Server = net.createServer((connection: net.Socket) => {
           // RESP3: return as Double type
           connection.write(encodeRESP3Double(distance));
         } else {
-          // RESP2: return as bulk string
-          connection.write(encodeBulkString(distance.toFixed(3)));
+          // RESP2: return as bulk string (full precision)
+          connection.write(encodeBulkString(distance.toString()));
         }
       }
     } else if (command === "geosearch") {
